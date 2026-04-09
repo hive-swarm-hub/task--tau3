@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+.credentials.json
+
+# Runtime artifacts
+results.tsv
+run.log
+traces/
+eval_airline/
+eval_retail/
+eval_telecom/
+eval_banking_knowledge/
+tau2-bench/
