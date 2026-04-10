@@ -15,7 +15,15 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from agent import annotate_banking
+    from agent import (
+        annotate_banking,
+        _DISCOVERABLE_CATALOG,
+        _VALID_DISCOVERABLE_NAMES,
+        _CATALOG_PROMPT_SECTION,
+        _parse_discoverable_catalog,
+        create_custom_agent,
+    )
+    from tau2.data_model.message import AssistantMessage, ToolCall
 except ImportError as e:
     print(f"ERROR: cannot import annotate_banking from agent.py")
     print(f"Reason: {e}")
@@ -277,6 +285,130 @@ def test_annotator_enum_constraint():
     assert_contains(result, "unauthorized_fraudulent_charge", "enum values extracted")
 
 
+# ── catalog tests ────────────────────────────────────────────────────────────
+
+def test_catalog_loaded():
+    section("test_catalog_loaded — all 48 discoverable tools parsed from tau2-bench")
+    agent = _DISCOVERABLE_CATALOG.get("agent", [])
+    user = _DISCOVERABLE_CATALOG.get("user", [])
+    # τ²-bench v1.0.0 has 44 agent-side + 4 user-side = 48 total
+    assert_eq(len(agent), 44, "44 agent-side discoverable tools")
+    assert_eq(len(user), 4, "4 user-side discoverable tools")
+    assert_eq(len(_VALID_DISCOVERABLE_NAMES), 48, "48 unique names in validation set")
+
+
+def test_catalog_contains_key_tools():
+    section("test_catalog_contains_key_tools — known names are present")
+    for name in [
+        "update_transaction_rewards_3847",
+        "submit_cash_back_dispute_0589",
+        "activate_debit_card_8291",
+        "activate_debit_card_8292",
+        "activate_debit_card_8293",
+        "initial_transfer_to_human_agent_0218",
+        "initial_transfer_to_human_agent_1822",
+        "emergency_credit_bureau_incident_transfer_1114",
+        "apply_statement_credit_8472",
+        "get_all_user_accounts_by_user_id_3847",
+    ]:
+        assert_contains(_VALID_DISCOVERABLE_NAMES, name, f"{name} in catalog")
+
+
+def test_catalog_rejects_hallucinated_names():
+    section("test_catalog_rejects_hallucinated_names")
+    for fake in [
+        "change_user_email_9921",     # observed hallucination in task_004
+        "change_user_email_1928",     # observed hallucination in task_004
+        "submit_business_checking_account_referral_lime_green_003",  # task_100
+        "completely_made_up_0001",
+    ]:
+        assert_true = lambda cond, label: None  # no-op
+        if fake not in _VALID_DISCOVERABLE_NAMES:
+            global PASSED
+            PASSED += 1
+            print(f"  ✓ {fake} correctly absent from catalog")
+        else:
+            global FAILED
+            FAILED += 1
+            print(f"  ✗ {fake} incorrectly in catalog")
+
+
+def test_catalog_section_in_prompt():
+    section("test_catalog_section_in_prompt — prompt rendering")
+    assert_contains(_CATALOG_PROMPT_SECTION, "Discoverable tool catalog", "header present")
+    assert_contains(_CATALOG_PROMPT_SECTION, "activate_debit_card_8291", "variant 1")
+    assert_contains(_CATALOG_PROMPT_SECTION, "activate_debit_card_8292", "variant 2")
+    assert_contains(_CATALOG_PROMPT_SECTION, "activate_debit_card_8293", "variant 3")
+    assert_contains(_CATALOG_PROMPT_SECTION, "submit_cash_back_dispute_0589", "user-side tool")
+    assert_contains(_CATALOG_PROMPT_SECTION, "User-side tools", "user section header")
+
+
+def test_gate_drops_hallucinated_unlock():
+    section("test_gate_drops_hallucinated_unlock — intervention D")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="unlock_discoverable_agent_tool",
+                 arguments={"agent_tool_name": "change_user_email_9921"}),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(out.tool_calls, None, "tool_calls dropped")
+    assert_contains(out.content, "does not exist", "drop note explains why")
+    interventions = agent._task_state.get("gate_interventions", [])
+    assert_eq(len(interventions), 1, "one intervention logged")
+    assert_eq(interventions[0]["reason"], "dropped_hallucinated_tool_name", "reason: hallucinated")
+
+
+def test_gate_drops_hallucinated_give():
+    section("test_gate_drops_hallucinated_give — intervention D (give variant)")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="give_discoverable_user_tool",
+                 arguments={"discoverable_tool_name": "nonexistent_tool_9999"}),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(out.tool_calls, None, "tool_calls dropped")
+    assert_contains(out.content, "does not exist", "drop note")
+
+
+def test_gate_allows_valid_unlock():
+    section("test_gate_allows_valid_unlock — positive case")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="unlock_discoverable_agent_tool",
+                 arguments={"agent_tool_name": "update_transaction_rewards_3847"}),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(len(out.tool_calls or []), 1, "valid unlock kept")
+    assert_eq(out.tool_calls[0].name, "unlock_discoverable_agent_tool", "name preserved")
+
+
+def test_gate_encodes_dict_arguments():
+    section("test_gate_encodes_dict_arguments — intervention C")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="call_discoverable_agent_tool", arguments={
+            "agent_tool_name": "update_transaction_rewards_3847",
+            "arguments": {"transaction_id": "txn_abc", "new_rewards_earned": "157 points"},
+        }),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(len(out.tool_calls or []), 1, "call kept")
+    import json as _j
+    encoded = out.tool_calls[0].arguments["arguments"]
+    assert_eq(isinstance(encoded, str), True, "arguments is now a string")
+    decoded = _j.loads(encoded)
+    assert_eq(decoded, {"transaction_id": "txn_abc", "new_rewards_earned": "157 points"}, "roundtrips")
+
+
+def test_parse_catalog_missing_file():
+    section("test_parse_catalog_missing_file — safe default")
+    from pathlib import Path
+    result = _parse_discoverable_catalog(Path("/does/not/exist.py"))
+    assert_eq(result["agent"], [], "agent tools empty")
+    assert_eq(result["user"], [], "user tools empty")
+    assert_eq(result["by_name"], {}, "by_name empty")
+
+
 # ── runner ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -301,6 +433,16 @@ def main():
     test_annotator_already_verified()
     test_annotator_escalation_signal()
     test_annotator_enum_constraint()
+    # catalog tests
+    test_catalog_loaded()
+    test_catalog_contains_key_tools()
+    test_catalog_rejects_hallucinated_names()
+    test_catalog_section_in_prompt()
+    test_gate_drops_hallucinated_unlock()
+    test_gate_drops_hallucinated_give()
+    test_gate_allows_valid_unlock()
+    test_gate_encodes_dict_arguments()
+    test_parse_catalog_missing_file()
 
     print(f"\n{'='*60}")
     print(f"  {PASSED} passed, {FAILED} failed")

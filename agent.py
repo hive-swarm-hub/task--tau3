@@ -4,16 +4,24 @@ This file is self-contained: all agent logic lives here. Modify anything.
 The agent receives customer messages, domain tools (including KB_search), and
 must follow the domain policy to resolve banking customer service tasks.
 
-The PRIMARY optimization lever is `annotate_banking()` — it's the only code
-path between τ²-bench's BM25 retriever and the LLM. Every KB_search result
-passes through it before reaching the agent's context. Evolve it based on
-what your failure traces show.
+Two optimization levers:
+1. `annotate_banking()` — only code path between τ²-bench's BM25 retriever
+   and the LLM. Every KB_search result passes through it before reaching
+   the agent's context.
+2. `_DISCOVERABLE_CATALOG` — a parsed index of all 48 @is_discoverable_tool
+   functions in tau2-bench's banking_knowledge tools.py. Built at import
+   time by AST-parsing the source file (we read tau2-bench source but do
+   not import from it). The catalog is rendered into the system prompt so
+   the agent knows every discoverable tool that exists from turn 0, without
+   requiring repetitive KB_search discovery across swarm agents.
 """
 
+import ast
 import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import Optional
 
 from litellm import completion
@@ -35,6 +43,174 @@ from tau2.data_model.message import (
 )
 from tau2.environment.tool import Tool
 
+# ── DISCOVERABLE TOOL CATALOG ────────────────────────────────────────────────
+#
+# AGENTS.md §3 enumerates the 48 agent-side + 4 user-side discoverable tools
+# as public knowledge. Rather than forcing every swarm agent to rediscover
+# them via BM25 KB_search on every task, we parse tools.py once at import
+# time and build a static catalog. This:
+#
+# 1. Eliminates tool-name hallucinations (the agent can only unlock names
+#    that actually exist in the catalog).
+# 2. Skips retrieval misses — if the right doc isn't in the top-10 BM25
+#    results, the agent still knows the tool exists and what it does.
+# 3. Disambiguates variant families (e.g., activate_debit_card_8291 vs
+#    _8292 vs _8293) at turn 0 by embedding their "Use ONLY for X" prose.
+# 4. Exposes enum constraints from docstrings (e.g., `reason` must be one
+#    of a specific set) before the agent makes a tool call.
+#
+# The parse is safe: it's pure stdlib ast over a local source file. The
+# orchestration explicitly permits reading tau2-bench source (AGENTS.md §12)
+# and the catalog only summarizes public API surface.
+
+_TAU2_TOOLS_PATH = (
+    Path(__file__).parent
+    / "tau2-bench"
+    / "src"
+    / "tau2"
+    / "domains"
+    / "banking_knowledge"
+    / "tools.py"
+)
+
+
+def _parse_discoverable_catalog(source_path: Path = _TAU2_TOOLS_PATH) -> dict:
+    """Parse tau2-bench tools.py and return the discoverable tool catalog.
+
+    Structure:
+        {
+            "agent": [ {name, type, params, doc, doc_first_line}, ... ],
+            "user":  [ {name, type, params, doc, doc_first_line}, ... ],
+            "by_name": {tool_name: entry, ...},
+        }
+
+    Returns an empty catalog if the source file is missing (i.e., before
+    `bash prepare.sh` has cloned tau2-bench). This keeps imports safe in
+    test environments.
+    """
+    if not source_path.exists():
+        return {"agent": [], "user": [], "by_name": {}}
+
+    try:
+        src = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        return {"agent": [], "user": [], "by_name": {}}
+
+    agent: list[dict] = []
+    user: list[dict] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if node.name not in ("KnowledgeTools", "KnowledgeUserTools"):
+            continue
+
+        for fn in node.body:
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            is_discoverable = False
+            tool_type: Optional[str] = None
+            for dec in fn.decorator_list:
+                if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
+                    if dec.func.id == "is_discoverable_tool":
+                        is_discoverable = True
+                        if dec.args and isinstance(dec.args[0], ast.Attribute):
+                            tool_type = dec.args[0].attr  # e.g. "WRITE"
+                        break
+            if not is_discoverable:
+                continue
+
+            doc = ast.get_docstring(fn) or ""
+            entry = {
+                "name": fn.name,
+                "type": tool_type or "UNKNOWN",
+                "params": [a.arg for a in fn.args.args[1:]],  # skip self
+                "doc": doc,
+                "doc_first_line": doc.split("\n", 1)[0].strip() if doc else "",
+            }
+            if node.name == "KnowledgeTools":
+                agent.append(entry)
+            else:
+                user.append(entry)
+
+    by_name = {e["name"]: e for e in agent + user}
+    return {"agent": agent, "user": user, "by_name": by_name}
+
+
+def _render_catalog_for_prompt(catalog: dict, max_doc_chars: int = 140) -> str:
+    """Render the catalog as a compact prompt section.
+
+    Groups agent tools by READ/WRITE/GENERIC. Keeps each entry to one line
+    with name, params, and a truncated one-line description. Embeds the
+    full list of 4 user-side tools under their own heading.
+
+    ~3000 tokens total — compact enough to coexist with the base prompt
+    while giving the LLM complete visibility into the tool surface.
+    """
+    agent = catalog.get("agent", [])
+    user = catalog.get("user", [])
+
+    if not agent and not user:
+        return ""
+
+    by_type: dict[str, list[dict]] = {"READ": [], "WRITE": [], "GENERIC": []}
+    for t in agent:
+        by_type.setdefault(t["type"], []).append(t)
+
+    lines: list[str] = []
+    lines.append("## Discoverable tool catalog")
+    lines.append("")
+    lines.append(
+        f"Exactly {len(agent)} agent-side tools exist (unlock via "
+        f"`unlock_discoverable_agent_tool(agent_tool_name=<name>)`) and "
+        f"{len(user)} user-side tools (give via "
+        f"`give_discoverable_user_tool(discoverable_tool_name=<name>)`). "
+        f"These are the ONLY discoverable tool names that exist — do NOT "
+        f"invent or guess any other names."
+    )
+    lines.append("")
+
+    def short(entry: dict) -> str:
+        params = ", ".join(entry["params"]) if entry["params"] else ""
+        desc = entry["doc_first_line"][:max_doc_chars]
+        return f"- `{entry['name']}({params})` — {desc}"
+
+    if by_type.get("READ"):
+        lines.append(f"### Agent READ tools ({len(by_type['READ'])})")
+        for t in sorted(by_type["READ"], key=lambda x: x["name"]):
+            lines.append(short(t))
+        lines.append("")
+    if by_type.get("WRITE"):
+        lines.append(f"### Agent WRITE tools ({len(by_type['WRITE'])})")
+        for t in sorted(by_type["WRITE"], key=lambda x: x["name"]):
+            lines.append(short(t))
+        lines.append("")
+    if by_type.get("GENERIC"):
+        lines.append(f"### Agent GENERIC tools ({len(by_type['GENERIC'])})")
+        for t in sorted(by_type["GENERIC"], key=lambda x: x["name"]):
+            lines.append(short(t))
+        lines.append("")
+
+    if user:
+        lines.append(f"### User-side tools ({len(user)}) — call give_discoverable_user_tool")
+        for t in sorted(user, key=lambda x: x["name"]):
+            lines.append(short(t))
+        lines.append("")
+
+    lines.append(
+        "**When you know which tool you need from this catalog, you can unlock/give "
+        "it directly without having to find it via KB_search. Still use KB_search to "
+        "read the relevant procedure/policy doc for preconditions and enum constraints.**"
+    )
+
+    return "\n".join(lines)
+
+
+_DISCOVERABLE_CATALOG = _parse_discoverable_catalog()
+_CATALOG_PROMPT_SECTION = _render_catalog_for_prompt(_DISCOVERABLE_CATALOG)
+_VALID_DISCOVERABLE_NAMES: set[str] = set(_DISCOVERABLE_CATALOG.get("by_name", {}).keys())
+
 # ── PROMPTS ──────────────────────────────────────────────────────────────────
 
 BASE_INSTRUCTIONS = """
@@ -51,61 +227,59 @@ You are a customer service agent for a bank. You MUST follow the <policy> exactl
 5. If a request is against policy OR requires escalation, deny/escalate. Do NOT just comply because the customer insists.
 6. Do not proactively offer compensation unless the user explicitly asks.
 
-## Search-first discipline — this is mandatory
+## Search-first discipline
 
-**BEFORE making any mutation (write) tool call, you MUST have called KB_search for the specific procedure at least once.** The only mutations that do not require a prior KB_search are:
-- `log_verification` (for identity)
-- `get_*` read-only tools
+For any task involving disputes, discrepancies, payment problems, fraud, transfers to humans, or anything labeled "procedure" / "policy" by the customer's description, you MUST call `KB_search` at least once with targeted keywords BEFORE calling any discoverable tool. The discoverable tools live inside KB documents — you cannot find them without searching first.
 
-Every other mutation — `change_user_email`, `transfer_to_human_agents`, any `unlock_discoverable_agent_tool`, any `give_discoverable_user_tool`, any `close_*_NNNN`, any `submit_*_NNNN`, any `update_*_NNNN`, any `file_*_NNNN`, any `order_*_NNNN`, any `transfer_*_NNNN`, any `open_*_NNNN`, any `apply_*_NNNN`, any `freeze_*_NNNN`, any `activate_*_NNNN`, any `change_*_NNNN`, any `pay_*_NNNN`, any `initial_*_NNNN` — **requires** a targeted KB_search first. Skip this and you will almost certainly fail.
+Skip the search only for:
+- Pure identity verification (`log_verification` is safe without KB_search when the task is obviously just "look up my account")
+- Read-only lookups (`get_*` tools)
+- Trivially in-scope requests where the base tool is the clear answer (e.g., a routine `change_user_email` where the customer's claimed current email MATCHES the DB value)
 
 **Search queries should be specific:** use the product name, the procedure name, the customer-reported problem verbatim. Examples:
-- "change email address dispute procedure"
-- "payment not reflecting customer transfer"
 - "cash back rewards discrepancy dispute"
-- "Silver Rewards Card cash back dispute"
+- "payment not reflecting credit card balance"
+- "Silver Rewards Card replacement order"
+- "checking account referral business"
 
-If the first search is unproductive, try 2-3 different phrasings — but avoid repeating the same concept more than twice.
+If the first search is unproductive, try different phrasings focusing on the symptom rather than the product — but avoid repeating the same concept more than twice.
 
-**Escalation patterns to recognize (search KB for the exact pattern):**
-- Customer insists on account info that contradicts the DB (e.g., says "my email is X" but DB has Y) → possible account_ownership_dispute
-- Payment confirmed but not reflecting / balance discrepancy / funds missing → possible escalation scenario
-- Customer reports fraud, unauthorized activity, stolen card → dispute/freeze procedures
-- Customer wants to do something themselves → give_discoverable_user_tool, not unlock_discoverable_agent_tool
+**Escalation patterns to recognize:**
+- Customer's claimed CURRENT account field contradicts the DB → likely `account_ownership_dispute` → `transfer_to_human_agents`
+- Payment confirmed but not reflecting / balance discrepancy → likely a special discoverable transfer procedure (search KB with "payment not reflecting" or "backend incident")
+- Customer reports fraud, unauthorized activity, stolen card → search KB for specific dispute/freeze procedures
+- Customer wants to submit their own dispute / referral / deposit → `give_discoverable_user_tool` not `unlock_discoverable_agent_tool`
 
-## Discoverable tool workflow (CRITICAL)
+## Tool system
 
-Your initial tool list contains two categories of tools:
+Your initial tool list contains:
 
-1. BASE tools — always available:
+1. BASE tools — always available (call them directly):
    - `get_user_information_by_id` / `by_name` / `by_email`
    - `get_credit_card_accounts_by_user`, `get_credit_card_transactions_by_user`, `get_referrals_by_user`
-   - `log_verification` — writes to verification_history (don't call twice)
-   - `change_user_email` — only for legitimate email changes, NOT disputed ownership
-   - `transfer_to_human_agents` — last resort; many tasks prefer a discoverable `initial_transfer_to_human_agent_NNNN` variant first
+   - `log_verification` — writes to verification_history. Call ONCE per task.
+   - `change_user_email` — only for legitimate email changes where the customer's claimed CURRENT email matches the DB.
+   - `transfer_to_human_agents(reason, summary)` — escalation. For specific incidents (e.g., 11/13 backend payment incident, purchase-decline human-transfer protocol), the task may instead require a discoverable `initial_transfer_to_human_agent_NNNN` or `emergency_*_transfer_1114` variant BEFORE this one.
    - `get_current_time`
+   - `KB_search(query)` — BM25 search over 698 banking policy/procedure docs.
 
-2. DISCOVERY meta-tools — always available, used to activate ACTION tools:
-   - `list_discoverable_agent_tools()` — shows what's currently unlocked for you
-   - `unlock_discoverable_agent_tool(agent_tool_name="...")` — activates an action tool for YOU (the agent) to call
-   - `give_discoverable_user_tool(discoverable_tool_name="...")` — activates an action tool for the USER to call
-   - `call_discoverable_agent_tool(agent_tool_name="...", arguments="...")` — invokes a previously unlocked tool. **`arguments` is a JSON-ENCODED STRING, not a dict. Pass `'{"key":"value"}'` not `{"key":"value"}`.**
+2. DISCOVERY meta-tools — always available, used to activate the 48 discoverable tools in the catalog below:
+   - `list_discoverable_agent_tools()` — shows what you've already unlocked this task
+   - `unlock_discoverable_agent_tool(agent_tool_name="<exact_name>")` — activates a tool for YOU to call
+   - `give_discoverable_user_tool(discoverable_tool_name="<exact_name>")` — activates a tool for the CUSTOMER to call (for the 4 user-side tools, OR when the agent-side tool's procedure doc says the customer performs it)
+   - `call_discoverable_agent_tool(agent_tool_name="<name>", arguments="<JSON STRING>")` — invokes a previously-unlocked tool. **`arguments` MUST be a JSON-encoded string, NOT a dict.** Pass `'{"user_id":"u1"}'` not `{"user_id":"u1"}`.
 
-ACTION TOOLS (like `submit_cash_back_dispute_0589`, `update_transaction_rewards_3847`, `initial_transfer_to_human_agent_0218`) are NOT in your initial tool list. They are only mentioned inside KB_search results by their exact name — lowercase underscores followed by a 4+ digit suffix.
+The catalog below lists every discoverable tool that exists. When a customer's situation maps to one of these tools, you can unlock/give it directly without requiring a KB_search first. Still use KB_search for procedure context and enum constraint details.
 
-The canonical sequence:
-1. KB_search → read results, extract the EXACT tool name (copy-paste; do not retype)
-2. Decide who performs the action:
-   - KB prose says "the customer submits/must/should", "have the customer", "the user submits" → `give_discoverable_user_tool(discoverable_tool_name="...")`
-   - Otherwise → `unlock_discoverable_agent_tool(agent_tool_name="...")`
-3. After unlocking, call the tool by its exact name (framework exposes it as a regular tool after unlock, OR use `call_discoverable_agent_tool`)
+{CATALOG}
 
-**Hard rules:**
-- NEVER guess tool names. Always copy them EXACTLY from KB_search results.
-- NEVER call a discoverable tool before unlocking/giving it — it will error.
-- NEVER unlock a tool for the agent when the KB doc says the customer performs the action.
-- NEVER both `unlock_discoverable_agent_tool` AND `give_discoverable_user_tool` for the same tool in the same task — pick one based on the KB wording.
-- NEVER make an "extra" tool call (e.g., a second log_verification, or unlocking a tool you don't actually use) — every mutation is hashed and extras fail the task.
+## Tool usage hard rules
+
+- NEVER invent or guess tool names. The catalog above is EXHAUSTIVE — any name not in it does not exist.
+- A discoverable tool must be unlocked/given before being called, or it will error.
+- Pick the RIGHT variant in families (activate_debit_card_{8291|8292|8293}, initial_transfer_to_human_agent_{0218|1822}) — the docstring or KB doc tells you which one by customer situation.
+- NEVER both `unlock_discoverable_agent_tool` AND `give_discoverable_user_tool` for the same tool in the same task — pick one based on the KB doc and customer context.
+- NEVER make an "extra" tool call. Every mutation is hashed for db_match. Extras fail the task.
 
 ## Minimalism — strict exact-match scoring
 
@@ -117,14 +291,31 @@ This benchmark grades by comparing your final database state against the oracle'
 
 Do exactly what the task requires. Nothing more, nothing less. Do not guess which variant of a tool to call — look at the docstring (after unlocking, it contains the enum constraints) and match the customer's situation carefully.
 
+## After giving a user tool — critical protocol
+
+When you call `give_discoverable_user_tool(discoverable_tool_name=X)`, the customer will NOT automatically know what arguments to pass. In the SAME turn as the give (or the immediately following text turn), you should:
+
+1. Tell the customer EXACTLY which values to provide — transaction_ids, account_ids, etc. Pull these from DB reads first if needed.
+2. Provide a clear example invocation like `submit_cash_back_dispute_0589(user_id="6680a37184", transaction_id="txn_abc123")`.
+3. Then STOP. Do not re-search, re-give, or call more tools. Wait for the customer to call the tool. The next turn will contain the tool result.
+
+## Watch for account-ownership disputes — CRITICAL
+
+When the customer says "my current email is X" or "my current [field] is Y" as if stating a known fact about their existing account, COMPARE it against the DB value from `get_user_information_by_*`. If the customer's claimed CURRENT value does not match the DB, this is almost certainly an account_ownership_dispute:
+
+- Customer: "my current email is kenji@gmail.com"
+- DB: "kenji@outlook.com"
+- Action: do NOT call change_user_email. Call `transfer_to_human_agents(reason="account_ownership_dispute", summary="<concise>")`.
+
+Simple email-update requests ("I want to change my email from X to Y" where X matches DB) are fine to handle with the base `change_user_email` tool. But a mismatch on the CURRENT value is an ownership red flag — the person may not be who they say they are.
+
 ## Key practices
-- First identify the user (`get_user_information_by_*`) and verify identity (`log_verification`, ONCE).
-- If the customer provides info, verify it matches the DB before assuming it's correct.
-- Read KB results carefully — every procedure has constraints and tool names embedded.
-- Use exact values from tool results (IDs, dates, amounts). Do not guess or approximate.
+- Identify the user and verify identity (`log_verification`, ONCE per task — extra calls fail db_match).
+- Read KB results carefully — every procedure has constraints and exact tool names embedded.
+- Use exact values from tool results. Do not guess, do not approximate.
 - When the user confirms, proceed immediately — do not ask for confirmation twice.
-- Finish the ENTIRE procedure before reporting back. Many tasks have 3-15 expected actions.
-- Keep user-facing messages concise.
+- Do EXACTLY what the task requires — no more, no less. Extra mutations fail db_match.
+- Keep user-facing messages concise and include concrete data the customer needs.
 """.strip()
 
 SYSTEM_TEMPLATE = """
@@ -429,8 +620,11 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
 
     @property
     def system_prompt(self) -> str:
+        # Substitute the catalog into the base instructions. The catalog is
+        # built at module import time from tau2-bench source.
+        instructions = BASE_INSTRUCTIONS.replace("{CATALOG}", _CATALOG_PROMPT_SECTION)
         return SYSTEM_TEMPLATE.format(
-            instructions=BASE_INSTRUCTIONS,
+            instructions=instructions,
             policy=self.domain_policy,
         )
 
@@ -524,24 +718,24 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
     def _gate_tool_calls(self, assistant_msg: AssistantMessage) -> AssistantMessage:
         """Minimally-invasive rewrites to prevent known deterministic failures.
 
-        Every τ³-bench task is graded by DB hash equality. This means EVERY
-        extra tool call is a potential task-killer. This gate therefore only
-        rewrites when the current call is guaranteed-wrong given current state
-        and the rewrite is strictly safer.
+        Every τ³-bench task is graded by DB hash equality. Extra tool calls
+        fail db_match, so this gate removes redundant meta-tool calls. But
+        dropping alone is not enough — if the LLM keeps re-trying the same
+        dropped call, we stall. So whenever we drop, we ALSO inject a
+        visible user-facing note ("(already given, stop repeating)") that
+        shows up in the next LLM context as the content of the assistant
+        turn. This breaks the retry loop.
 
         Current interventions:
 
         A. DROP the duplicate-meta-tool pattern
            If the LLM tries to `unlock_discoverable_agent_tool(X)` for a tool
            already in `unlocked_for_user`, OR vice versa, drop that specific
-           call. This is an observed failure mode (task_100): the LLM gave a
-           tool to the user AND then unlocked it for itself, producing a
-           `wasted_unlocks` record that breaks db_match. Dropping one of the
-           two sides is strictly better because the chosen side still fires.
+           call and inject an explanation.
 
         B. DROP redundant re-unlock / re-give
            If the LLM tries to unlock/give a tool already in the corresponding
-           set, drop it. Dupes waste turns and can fail db_match.
+           set, drop it and inject an explanation.
 
         C. FIX dict-shaped `arguments` on `call_discoverable_agent_tool`
            τ²-bench requires the `arguments` parameter to be a JSON-encoded
@@ -549,7 +743,7 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
            target tool to effectively no-op. We JSON-encode on the fly.
 
         The gate NEVER adds calls the LLM didn't request, and NEVER changes
-        tool names. It only removes redundant calls and reformats arguments.
+        tool names. It only removes redundant calls and reformats args.
         All interventions are logged to `_task_state["gate_interventions"]`.
         """
         if not assistant_msg.tool_calls:
@@ -557,7 +751,9 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
 
         unlocked_agent = self._task_state.get("unlocked_for_agent", set())
         unlocked_user = self._task_state.get("unlocked_for_user", set())
+        mentioned_in_kb = self._task_state.get("mentioned_in_kb", set())
         kept: list[ToolCall] = []
+        drop_notes: list[str] = []
         log = self._task_state.setdefault("gate_interventions", [])
         turn = self._task_state.get("turn_count", 0)
 
@@ -565,38 +761,66 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             args = tc.arguments if isinstance(tc.arguments, dict) else {}
             name = tc.name
 
+            # Intervention D: hallucination guard — if the agent tries to
+            # unlock/give a discoverable tool name that does NOT exist in
+            # the parsed catalog, drop it. The downstream tau2 orchestrator
+            # would return "Error: Unknown discoverable tool X" which
+            # confuses the LLM. Dropping + injecting a corrective note is
+            # strictly better. This only fires when the catalog is non-empty
+            # (i.e., tau2-bench has been cloned).
+            if _VALID_DISCOVERABLE_NAMES and name in ("unlock_discoverable_agent_tool", "give_discoverable_user_tool"):
+                target = (
+                    args.get("agent_tool_name")
+                    or args.get("discoverable_tool_name")
+                    or args.get("tool_name")
+                )
+                if target and target not in _VALID_DISCOVERABLE_NAMES:
+                    log.append({
+                        "turn": turn,
+                        "reason": "dropped_hallucinated_tool_name",
+                        "target": target,
+                    })
+                    drop_notes.append(
+                        f"The tool name '{target}' does not exist in the discoverable "
+                        f"tool catalog. I should consult the catalog in my system prompt "
+                        f"for the correct name, or use a base tool if appropriate."
+                    )
+                    continue
+
             # Intervention A/B: deduplicate unlock/give
+            # When dropping, inject natural user-facing content that:
+            #  (a) the user simulator can respond to normally
+            #  (b) tells the LLM (via its own history on the next turn)
+            #      that the meta-tool call was already performed
             if name == "unlock_discoverable_agent_tool":
                 target = args.get("agent_tool_name") or args.get("tool_name")
                 if target and target in unlocked_user:
-                    log.append({
-                        "turn": turn,
-                        "reason": "dropped_unlock_already_given_to_user",
-                        "target": target,
-                    })
+                    log.append({"turn": turn, "reason": "dropped_unlock_already_given_to_user", "target": target})
+                    drop_notes.append(
+                        f"You already have access to {target} — I provided it earlier. "
+                        f"Please call it now with the required arguments."
+                    )
                     continue
                 if target and target in unlocked_agent:
-                    log.append({
-                        "turn": turn,
-                        "reason": "dropped_redundant_unlock",
-                        "target": target,
-                    })
+                    log.append({"turn": turn, "reason": "dropped_redundant_unlock", "target": target})
+                    drop_notes.append(
+                        f"I already have {target} unlocked and will proceed with the call."
+                    )
                     continue
             elif name == "give_discoverable_user_tool":
                 target = args.get("discoverable_tool_name") or args.get("tool_name")
                 if target and target in unlocked_agent:
-                    log.append({
-                        "turn": turn,
-                        "reason": "dropped_give_already_unlocked_for_agent",
-                        "target": target,
-                    })
+                    log.append({"turn": turn, "reason": "dropped_give_already_unlocked_for_agent", "target": target})
+                    drop_notes.append(
+                        f"I will handle {target} on your behalf since I have it unlocked."
+                    )
                     continue
                 if target and target in unlocked_user:
-                    log.append({
-                        "turn": turn,
-                        "reason": "dropped_redundant_give",
-                        "target": target,
-                    })
+                    log.append({"turn": turn, "reason": "dropped_redundant_give", "target": target})
+                    drop_notes.append(
+                        f"You already have access to {target} — I provided it earlier. "
+                        f"Please call it now with the required arguments."
+                    )
                     continue
 
             # Intervention C: JSON-encode dict-shaped `arguments`
@@ -614,20 +838,27 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
 
             kept.append(tc)
 
-        # If we dropped everything, return an empty text response so the
-        # orchestrator advances to the next turn. Empty tool_calls with
-        # content="" is legal — the LLM re-tries on the next turn.
+        # If we dropped everything, we MUST return visible content so the
+        # LLM sees what happened and doesn't immediately retry the same call.
+        # The injected note replaces the assistant turn's content so it shows
+        # up in the next LLM context as "assistant said X".
         if not kept and assistant_msg.tool_calls:
+            note = " ".join(drop_notes) if drop_notes else "(gate dropped call)"
             return AssistantMessage(
                 role="assistant",
-                content=assistant_msg.content or "(pending)",
+                content=(assistant_msg.content + " " + note).strip() if assistant_msg.content else note,
                 tool_calls=None,
             )
 
         if kept != assistant_msg.tool_calls:
+            # Partial drop: keep surviving calls, append drop notes to content
+            # so future turns see what happened.
+            content = assistant_msg.content or ""
+            if drop_notes:
+                content = (content + " " + " ".join(drop_notes)).strip()
             return AssistantMessage(
                 role="assistant",
-                content=assistant_msg.content or "",
+                content=content,
                 tool_calls=kept or None,
             )
         return assistant_msg
