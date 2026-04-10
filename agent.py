@@ -125,7 +125,7 @@ _USER_ACTION_INDICATORS = [
 ]
 
 
-def annotate_banking(content: str) -> str:
+def annotate_banking(content: str, state: dict | None = None) -> str:
     """Surface discoverable tools and procedure requirements from KB_search results.
 
     This is the PRIMARY optimization lever. Swarm agents should evolve this
@@ -133,7 +133,17 @@ def annotate_banking(content: str) -> str:
     common failure class, and add an annotation that surfaces the missing
     signal. Additions are additive.
 
-    Current annotations:
+    Args:
+        content: the raw tool result content from KB_search (or any ToolMessage)
+        state: optional CustomAgent._task_state dict. The base scaffold does NOT
+            use state — all existing annotations are stateless. Agents add
+            state-aware annotations by reading fields like
+            state["unlocked_for_agent"] and state["verified_user_ids"] to
+            build context-dependent notes (e.g. "ALREADY UNLOCKED: [...]"
+            vs "STILL TO UNLOCK: [...]"). The signature accepts state so
+            swarm agents can extend annotations without changing the caller.
+
+    Current annotations (stateless, carry over from baseline):
     1. Discoverable tool name extraction → reminds agent to unlock before calling
     2. User-facing action detection → reminds agent to use give_* not unlock_*
     3. Identity verification requirement → reminds agent to call log_verification
@@ -205,7 +215,9 @@ def to_api_messages(messages, annotator=None):
 
     If annotator is provided, it is called on tool message content before
     the message is passed to the LLM. This is the hook that makes
-    annotate_banking() effective.
+    annotate_banking() effective. The annotator callback takes (content: str)
+    and returns str. Callers that want to pass state should wrap the
+    annotator in a closure: `lambda c: annotate_banking(c, state=self._task_state)`.
     """
     out = []
     for m in messages:
@@ -259,13 +271,37 @@ LOOP_BREAK_LIMIT = 5  # Force text response after N consecutive tool calls to br
 
 
 class CustomAgent(LLMAgent):
-    """Self-contained banking knowledge customer service agent."""
+    """Self-contained banking knowledge customer service agent.
+
+    The class provides three extension points for swarm agents to build on
+    WITHOUT refactoring the foundation:
+
+    1. `_task_state` dict — neutral per-task state container, reset on every
+       new task. The base scaffold populates five fields (turn_count,
+       tool_call_ledger, last_tool_result_by_name, mentioned_in_kb,
+       verified_user_ids) via `_track_state()`. Agents add whatever
+       additional fields they need.
+
+    2. `_gate_tool_calls(msg)` — a NO-OP hook by default. Agents fill it in
+       with interception/rewrite logic (e.g. verification gating, unlock
+       enforcement, argument correction).
+
+    3. `annotate_banking(content, state=...)` — the tool-result annotator
+       now receives `self._task_state` via closure. Agents add state-aware
+       annotations (e.g. "ALREADY UNLOCKED: [...]", "VERIFIED: yes").
+
+    Nothing in this base class enforces any specific priority — it only
+    measures facts and exposes hooks. See program.md for the priority
+    framework agents use to pick what to work on.
+    """
 
     def __init__(self, tools: list[Tool], domain_policy: str, llm=None, llm_args=None):
         LocalAgent.__init__(self, tools=tools, domain_policy=domain_policy)
         self.llm = llm or os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
         self.llm_args = dict(llm_args or {})
         self._consecutive_tool_calls = 0
+        self._task_state: dict = {}
+        self._reset_task_state()
 
     @property
     def system_prompt(self) -> str:
@@ -274,7 +310,107 @@ class CustomAgent(LLMAgent):
             policy=self.domain_policy,
         )
 
+    # ── state management ────────────────────────────────────────────────
+
+    def _reset_task_state(self) -> None:
+        """Initialize per-task state. Reset on every new task via get_init_state().
+
+        This is a NEUTRAL container — no fields are interpreted or enforced by
+        the base agent. Agents in the swarm decide what to put here and how to
+        use it. The keys below are suggestions populated by the base
+        `_track_state()`, not requirements. Agents extend freely.
+        """
+        self._task_state = {
+            "turn_count": 0,
+            "tool_call_ledger": [],         # append-only list of {name, args, turn}
+            "last_tool_result_by_name": {}, # tool name -> parsed JSON of latest result
+            "mentioned_in_kb": set(),       # discoverable tool names seen in KB results
+            "verified_user_ids": set(),     # populated when log_verification succeeds
+            # swarm agents may add fields like:
+            # "unlocked_for_agent": set(),
+            # "unlocked_for_user": set(),
+            # "kb_searches": [],
+            # "argument_corrections": [],
+            # "procedure_checklist": [],
+            # ... whatever their priority implementation needs
+        }
+        self._consecutive_tool_calls = 0
+
+    def _track_state(self, incoming, assistant_msg) -> None:
+        """Record facts from this turn into _task_state. Does NOT intervene.
+
+        Facts recorded (base scaffold — stays neutral):
+        - turn_count incremented
+        - Every outgoing tool call appended to tool_call_ledger
+        - log_verification calls update verified_user_ids
+        - Incoming tool result JSON parsed into last_tool_result_by_name
+          (keyed by the most recent tool call name as a best-effort match)
+        - Discoverable tool names from KB results accumulated into mentioned_in_kb
+
+        Agents extend this method (or write directly to self._task_state from
+        annotate_banking / _gate_tool_calls) to track additional facts for
+        their priority implementation.
+        """
+        self._task_state["turn_count"] = self._task_state.get("turn_count", 0) + 1
+
+        # Log outgoing tool calls
+        if assistant_msg is not None and assistant_msg.tool_calls:
+            for tc in assistant_msg.tool_calls:
+                self._task_state["tool_call_ledger"].append({
+                    "name": tc.name,
+                    "args": tc.arguments if isinstance(tc.arguments, dict) else {},
+                    "turn": self._task_state["turn_count"],
+                })
+                # Neutral: note when log_verification fires
+                if tc.name == "log_verification" and isinstance(tc.arguments, dict):
+                    user_id = tc.arguments.get("user_id")
+                    if user_id:
+                        self._task_state["verified_user_ids"].add(user_id)
+
+        # Parse incoming tool results and accumulate KB mentions
+        tool_messages = []
+        if isinstance(incoming, ToolMessage):
+            tool_messages = [incoming]
+        elif isinstance(incoming, MultiToolMessage):
+            tool_messages = list(incoming.tool_messages)
+
+        for tm in tool_messages:
+            content = tm.content or ""
+            # Accumulate discoverable tool mentions from KB results
+            for name in _DISCOVERABLE_TOOL_PATTERN.findall(content):
+                self._task_state["mentioned_in_kb"].add(name)
+            # Parse JSON result if possible; pair with most recent tool call by position
+            try:
+                parsed = json.loads(content)
+                if self._task_state["tool_call_ledger"]:
+                    last_call = self._task_state["tool_call_ledger"][-1]
+                    self._task_state["last_tool_result_by_name"][last_call["name"]] = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    def _gate_tool_calls(self, assistant_msg: AssistantMessage) -> AssistantMessage:
+        """Hook for intercepting/rewriting tool calls before they execute.
+
+        By default this is a NO-OP — it returns assistant_msg unchanged.
+        Swarm agents implement rewrite rules here based on their failure traces.
+
+        Common patterns agents may choose to implement (examples, NOT mandatory):
+        - Priority 1: rewrite mutation tool calls to log_verification if unverified
+        - Priority 1: rewrite discoverable tool calls to unlock calls if not unlocked
+        - Priority 2: rewrite argument values if they disagree with known_values
+        - ...
+
+        When you rewrite, log the intervention to self._task_state["...":"..."]
+        so traces show why the rewrite fired and agents reading traces can
+        diagnose over/under-interception.
+        """
+        return assistant_msg
+
+    # ── main loop ────────────────────────────────────────────────────────
+
     def get_init_state(self, message_history=None) -> LLMAgentState:
+        # tau2-bench calls this once per task — perfect place to reset state
+        self._reset_task_state()
         return LLMAgentState(
             system_messages=[SystemMessage(role="system", content=self.system_prompt)],
             messages=list(message_history or []),
@@ -285,15 +421,15 @@ class CustomAgent(LLMAgent):
         if isinstance(message, MultiToolMessage):
             state.messages.extend(message.tool_messages)
         elif isinstance(message, UserMessage):
-            self._consecutive_tool_calls = 0  # reset on user input
+            self._consecutive_tool_calls = 0  # reset loop counter on user input
             state.messages.append(message)
         else:
             state.messages.append(message)
 
-        # 2. Build API request with annotator applied to tool results
+        # 2. Build API request with stateful annotator applied to tool results
         api_messages = to_api_messages(
             state.system_messages + state.messages,
-            annotator=annotate_banking,
+            annotator=lambda c: annotate_banking(c, state=self._task_state),
         )
         api_tools = [t.openai_schema for t in self.tools] if self.tools else None
 
@@ -322,12 +458,20 @@ class CustomAgent(LLMAgent):
                     continue
                 raise
 
-        # 5. Parse response and track consecutive tool calls
+        # 5. Parse response
         assistant_msg = parse_response(response.choices[0].message)
+
+        # 6. Gate hook — swarm agents put rewrite rules here. NO-OP by default.
+        assistant_msg = self._gate_tool_calls(assistant_msg)
+
+        # 7. Track consecutive tool calls for the loop breaker
         if assistant_msg.tool_calls:
             self._consecutive_tool_calls += 1
         else:
             self._consecutive_tool_calls = 0
+
+        # 8. Record facts from this turn into _task_state (neutral, no intervention)
+        self._track_state(message, assistant_msg)
 
         state.messages.append(assistant_msg)
         return assistant_msg, state

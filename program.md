@@ -215,6 +215,70 @@ LOOP FOREVER:
 
 **Timeout**: If a run exceeds 60 minutes, kill it and treat as crash.
 
+## Priority framework for experiment selection
+
+Failures in banking_knowledge cluster into four classes, ordered by causal dependency. The scaffold classifies every failed task into one of these classes (`primary_failure_class` in `traces/latest.json`) and aggregates counts into `summary.failure_class_counts`. Use this as your experiment selection heuristic — NOT as a template to copy.
+
+**The scaffold is deliberately neutral.** The base `agent.py` does not implement any of these priorities. Your job as a swarm agent is to read the failure class distribution, pick the dominant class, and build the solution yourself using the extension points below.
+
+### The four priorities
+
+1. **priority_1_verification_or_unlock** — the agent either called a mutation tool before verifying identity, or referenced a discoverable tool it never unlocked. These are deterministic blockers: the tool either hard-errors or the evaluator zeroes the action. Fix them first because they mask every downstream signal.
+
+2. **priority_2_wrong_arguments** — the agent called the correct tool name but with arguments that don't exact-match the golden action. τ²-bench's action evaluator uses strict dict equality on compared argument keys, so wrong ID format, off-by-one rounding, or wrong enum string = reward 0.
+
+3. **priority_3_retrieval_miss** — the agent searched KB three or more times but never retrieved a document containing a discoverable tool name. Either query formulation is off or the agent is asking for things not in the KB.
+
+4. **priority_4_execution_discipline** — the catch-all. Includes under-action (stopped partway), over-action (did extras not in the golden action list), communication misses (substring-based evaluator didn't find required phrases), and max_steps terminations. These are coupled — fixing one often moves another.
+
+### Why this ordering
+
+Deterministic blockers (P1) → exact-equality failures (P2) → probabilistic retrieval (P3) → cross-cutting discipline (P4). Each earlier priority masks later ones. If P1 is dominant, fixing P2/P3/P4 won't move the score because tasks still die at the gate.
+
+Backed by τ-Knowledge paper findings: even with oracle retrieval (`golden_retrieval` config), pass^1 only rises to ~40% — procedural correctness is the dominant failure driver, not retrieval. Agent-side discipline (gating, provenance, argument fidelity) matters more than retrieval configuration. See `/Users/hansonxiong/Downloads/deep-research-report (2).md` for the full research.
+
+### Experiment selection heuristic
+
+```
+1. Read traces/latest.json summary.failure_class_counts.
+2. For each class C, compute impact = count[C] / total_failures.
+3. If the largest class is ≥ 1.5× the second-largest, attack it.
+4. If two classes are comparable (< 1.5× difference), use priority order as
+   tiebreaker (P1 > P2 > P3 > P4).
+5. If all classes are small but pass_rate is low, attack P4 — failures are
+   scattered and discipline fixes the whole pipeline.
+6. After each experiment, re-read traces. If the attacked class shrank but
+   pass_rate is flat, a downstream class is now dominant. Recurse.
+```
+
+Never attack a priority that isn't in your current trace. The ordering is a planning prior — let the traces confirm before investing effort.
+
+### Extension points (where to implement solutions)
+
+The base scaffold exposes five places to add your priority-specific logic. Edit them in `agent.py` (for behavior) or `eval/extract_traces.py` (for new diagnostic signals):
+
+- **`annotate_banking(content, state=...)`** — rewrite KB_search tool results before the LLM sees them. The `state` argument is the full `_task_state` dict, so you can inject context-dependent notes (e.g. "ALREADY UNLOCKED: [...]" vs "STILL TO UNLOCK: [...]").
+
+- **`_gate_tool_calls(assistant_msg)`** — intercept the LLM's proposed tool calls and rewrite them before execution. By default this is a no-op. Fill in rules like "rewrite mutation tool call to log_verification if unverified" or "rewrite to unlock call if not unlocked". Log every rewrite to `self._task_state` so traces show why it fired.
+
+- **`_track_state(incoming, assistant_msg)`** — record facts from each turn into `_task_state`. Extend it with new tracking for your priority (e.g. "kb_searches" list, "argument_corrections" ledger). Does NOT intervene — only measures.
+
+- **`_task_state` dict** — per-task state container reset on every new task. Append fields as needed; the base scaffold only populates `turn_count`, `tool_call_ledger`, `last_tool_result_by_name`, `mentioned_in_kb`, `verified_user_ids`.
+
+- **`eval/extract_traces.py` analyzers** — add new signal fields for new failure patterns. Each analyzer is pure-read, stdlib-only. Don't add opinions about what the numbers mean; just produce counts that agents can classify from.
+
+### Before you start implementing
+
+1. Run a baseline: `SAMPLE_FRAC=0.1 bash eval/eval.sh > run.log 2>&1`
+2. Read `traces/latest.json` — check `summary.failure_class_counts`
+3. Pick the dominant class per the heuristic above
+4. Read the failing traces in that class — look at their `discoverable_tool_analysis`, `verification_analysis`, `argument_analysis`, `retrieval_analysis`, `execution_analysis` fields
+5. Pattern-match across several failures — what's the common signal?
+6. Pick ONE extension point and implement ONE rule targeting the pattern
+7. Re-run baseline, diff traces, decide keep/discard
+
+**Do not pre-implement multiple priorities at once.** Each experiment targets one priority. Measure before moving on.
+
 ## Recursive meta-improvement
 
 After every **10 experiments**, conduct a meta-review and update this file (`program.md`) itself:
