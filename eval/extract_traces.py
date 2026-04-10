@@ -235,7 +235,20 @@ def analyze_discoverable_tools(messages: list[dict]) -> dict:
                     except json.JSONDecodeError:
                         args = {}
 
-                target = args.get("tool_name", "") if isinstance(args, dict) else ""
+                # τ²-bench v1.0.0 uses distinct parameter names per meta-tool:
+                #   unlock_discoverable_agent_tool → agent_tool_name
+                #   give_discoverable_user_tool    → discoverable_tool_name
+                #   call_discoverable_agent_tool   → agent_tool_name
+                # Older code used "tool_name"; we accept all three for safety.
+                if isinstance(args, dict):
+                    target = (
+                        args.get("agent_tool_name")
+                        or args.get("discoverable_tool_name")
+                        or args.get("tool_name")
+                        or ""
+                    )
+                else:
+                    target = ""
 
                 if name in _UNLOCK_TOOLS and target:
                     unlocked_for_agent.add(target)
