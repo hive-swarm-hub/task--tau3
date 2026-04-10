@@ -133,9 +133,15 @@ def extract_conversation(messages: list[dict]) -> list[dict]:
 
 
 def extract_action_checks(reward_info: dict) -> list[dict]:
-    """Extract action correctness details from reward_info."""
+    """Extract action correctness details from reward_info.
+
+    `reward_info.get("action_checks")` can return None in v1.0.0 when the
+    task's `reward_basis` doesn't include "ACTION" (e.g., pure DB-match
+    tasks). Coerce None → [] so downstream iteration is safe.
+    """
     checks = []
-    for check in reward_info.get("action_checks", []):
+    raw_checks = reward_info.get("action_checks") or []
+    for check in raw_checks:
         action = check.get("expected_action", {}) or check.get("action", {})
         checks.append({
             "expected_tool": action.get("name", ""),
