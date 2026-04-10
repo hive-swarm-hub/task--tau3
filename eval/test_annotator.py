@@ -78,7 +78,7 @@ def test_discoverable_tool_mention():
         "submit_cash_back_dispute_0589 with the transaction_id."
     )
     result = annotate_banking(content)
-    assert_contains(result, "DISCOVERABLE TOOLS MENTIONED", "tool mention annotation present")
+    assert_contains(result, "STILL TO UNLOCK", "tool mention annotation present")
     assert_contains(result, "submit_cash_back_dispute_0589", "tool name in annotation")
     assert_contains(result, "unlock_discoverable_agent_tool", "unlock instruction present")
     assert_contains(result, "give_discoverable_user_tool", "give alternative mentioned")
@@ -105,7 +105,7 @@ def test_no_user_indicator_no_flag():
         "The agent should call submit_dispute_0001 to process the dispute."
     )
     result = annotate_banking(content)
-    assert_contains(result, "DISCOVERABLE TOOLS MENTIONED", "tool mention detected")
+    assert_contains(result, "STILL TO UNLOCK", "tool mention detected")
     assert_not_contains(result, "USER-FACING ACTION DETECTED", "no user-facing flag when agent-only")
 
 
@@ -165,7 +165,7 @@ def test_multiple_patterns_stack():
         "See also the disputes policy."
     )
     result = annotate_banking(content)
-    assert_contains(result, "DISCOVERABLE TOOLS MENTIONED", "tool mention")
+    assert_contains(result, "STILL TO UNLOCK", "tool mention")
     assert_contains(result, "VERIFICATION REQUIRED", "verification")
     assert_contains(result, "MULTI-STEP PROCEDURE", "multi-step")
     assert_contains(result, "CROSS-REFERENCE", "cross-reference")
@@ -189,7 +189,7 @@ def test_annotator_state_none():
     section("test_annotator_state_none — explicit state=None (backward compat)")
     content = "To file a dispute, use submit_cash_back_dispute_0589."
     result = annotate_banking(content, state=None)
-    assert_contains(result, "DISCOVERABLE TOOLS MENTIONED", "works with state=None")
+    assert_contains(result, "STILL TO UNLOCK", "works with state=None")
 
 
 def test_annotator_state_empty_dict():
@@ -212,7 +212,69 @@ def test_annotator_state_with_task_state():
     result = annotate_banking(content, state=state)
     # The base scaffold doesn't read state for annotations — verify it's still stateless-correct
     assert_contains(result, "submit_dispute_0001", "tool name extracted regardless of state")
-    assert_contains(result, "DISCOVERABLE TOOLS MENTIONED", "annotation added")
+    assert_contains(result, "STILL TO UNLOCK", "annotation added")
+
+
+# ── state-aware split tests ─────────────────────────────────────────────────
+
+def test_annotator_already_unlocked():
+    section("test_annotator_already_unlocked — STILL/ALREADY split")
+    content = (
+        "To file a dispute, use submit_cash_back_dispute_0589. "
+        "Or alternatively, call update_transaction_rewards_3847."
+    )
+    state = {
+        "unlocked_for_agent": {"submit_cash_back_dispute_0589"},
+        "unlocked_for_user": set(),
+        "verified_user_ids": set(),
+    }
+    result = annotate_banking(content, state=state)
+    assert_contains(result, "ALREADY UNLOCKED", "already unlocked section present")
+    assert_contains(result, "STILL TO UNLOCK", "still to unlock section present")
+    # update_transaction_rewards_3847 (not unlocked) must be in the STILL list
+    still_idx = result.index("STILL TO UNLOCK")
+    still_section = result[still_idx:still_idx + 400]
+    assert_contains(still_section, "update_transaction_rewards_3847", "unlisted tool in STILL TO UNLOCK")
+
+
+def test_annotator_already_given():
+    section("test_annotator_already_given — user-side unlock")
+    content = "Use submit_cash_back_dispute_0589 to process the refund."
+    state = {
+        "unlocked_for_agent": set(),
+        "unlocked_for_user": {"submit_cash_back_dispute_0589"},
+        "verified_user_ids": set(),
+    }
+    result = annotate_banking(content, state=state)
+    assert_contains(result, "ALREADY GIVEN", "already given section")
+    assert_not_contains(result, "STILL TO UNLOCK", "no redundant still-to-unlock")
+
+
+def test_annotator_already_verified():
+    section("test_annotator_already_verified — don't re-verify")
+    content = "Verify the customer's identity before proceeding."
+    state = {"verified_user_ids": {"u_abc123"}, "unlocked_for_agent": set(), "unlocked_for_user": set()}
+    result = annotate_banking(content, state=state)
+    assert_contains(result, "ALREADY called log_verification", "warns against duplicate verify")
+
+
+def test_annotator_escalation_signal():
+    section("test_annotator_escalation_signal")
+    content = "If the customer insists on a contested email, this is an account ownership dispute."
+    result = annotate_banking(content)
+    assert_contains(result, "ESCALATION SIGNAL", "escalation flag fires")
+    assert_contains(result, "account_ownership_dispute", "suggests the policy reason")
+
+
+def test_annotator_enum_constraint():
+    section("test_annotator_enum_constraint")
+    content = (
+        "dispute_reason must be one of: 'unauthorized_fraudulent_charge', "
+        "'duplicate_charge', 'incorrect_amount', 'item_not_received'."
+    )
+    result = annotate_banking(content)
+    assert_contains(result, "ENUM CONSTRAINT", "enum flag fires")
+    assert_contains(result, "unauthorized_fraudulent_charge", "enum values extracted")
 
 
 # ── runner ───────────────────────────────────────────────────────────────────
@@ -233,6 +295,12 @@ def main():
     test_annotator_state_none()
     test_annotator_state_empty_dict()
     test_annotator_state_with_task_state()
+    # state-aware annotation tests
+    test_annotator_already_unlocked()
+    test_annotator_already_given()
+    test_annotator_already_verified()
+    test_annotator_escalation_signal()
+    test_annotator_enum_constraint()
 
     print(f"\n{'='*60}")
     print(f"  {PASSED} passed, {FAILED} failed")
