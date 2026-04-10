@@ -16,7 +16,6 @@ Two optimization levers:
    requiring repetitive KB_search discovery across swarm agents.
 """
 
-import ast
 import json
 import os
 import re
@@ -43,173 +42,37 @@ from tau2.data_model.message import (
 )
 from tau2.environment.tool import Tool
 
-# ── DISCOVERABLE TOOL CATALOG ────────────────────────────────────────────────
+# ── DISCOVERABLE TOOL CATALOG (delegated to compass.py) ─────────────────────
 #
-# AGENTS.md §3 enumerates the 48 agent-side + 4 user-side discoverable tools
-# as public knowledge. Rather than forcing every swarm agent to rediscover
-# them via BM25 KB_search on every task, we parse tools.py once at import
-# time and build a static catalog. This:
+# Static catalog of the 48 discoverable tools is now provided by the shared
+# `compass` module — a standalone library any swarm agent can drop in:
 #
-# 1. Eliminates tool-name hallucinations (the agent can only unlock names
-#    that actually exist in the catalog).
-# 2. Skips retrieval misses — if the right doc isn't in the top-10 BM25
-#    results, the agent still knows the tool exists and what it does.
-# 3. Disambiguates variant families (e.g., activate_debit_card_8291 vs
-#    _8292 vs _8293) at turn 0 by embedding their "Use ONLY for X" prose.
-# 4. Exposes enum constraints from docstrings (e.g., `reason` must be one
-#    of a specific set) before the agent makes a tool call.
+#     from compass import COMPASS, validate_tool_name, suggest_tools
 #
-# The parse is safe: it's pure stdlib ast over a local source file. The
-# orchestration explicitly permits reading tau2-bench source (AGENTS.md §12)
-# and the catalog only summarizes public API surface.
+# This file keeps thin wrappers for backwards compatibility so that existing
+# test fixtures continue to reference _VALID_DISCOVERABLE_NAMES etc. New
+# code should prefer the compass API directly.
 
-_TAU2_TOOLS_PATH = (
-    Path(__file__).parent
-    / "tau2-bench"
-    / "src"
-    / "tau2"
-    / "domains"
-    / "banking_knowledge"
-    / "tools.py"
-)
+from compass import COMPASS
+
+_DISCOVERABLE_CATALOG = COMPASS.catalog
+_CATALOG_PROMPT_SECTION = COMPASS.render_prompt_section()
+_VALID_DISCOVERABLE_NAMES: set[str] = COMPASS.valid_names
 
 
-def _parse_discoverable_catalog(source_path: Path = _TAU2_TOOLS_PATH) -> dict:
-    """Parse tau2-bench tools.py and return the discoverable tool catalog.
+def _parse_discoverable_catalog(source_path: Optional[Path] = None) -> dict:
+    """Backwards-compat wrapper around compass.ToolCompass.
 
-    Structure:
-        {
-            "agent": [ {name, type, params, doc, doc_first_line}, ... ],
-            "user":  [ {name, type, params, doc, doc_first_line}, ... ],
-            "by_name": {tool_name: entry, ...},
-        }
-
-    Returns an empty catalog if the source file is missing (i.e., before
-    `bash prepare.sh` has cloned tau2-bench). This keeps imports safe in
-    test environments.
+    New code should import `COMPASS` from `compass` directly. This wrapper
+    exists so existing tests in test_annotator.py that reference the
+    legacy parser continue to work.
     """
-    if not source_path.exists():
-        return {"agent": [], "user": [], "by_name": {}}
-
-    try:
-        src = source_path.read_text(encoding="utf-8")
-        tree = ast.parse(src)
-    except (OSError, SyntaxError):
-        return {"agent": [], "user": [], "by_name": {}}
-
-    agent: list[dict] = []
-    user: list[dict] = []
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
-            continue
-        if node.name not in ("KnowledgeTools", "KnowledgeUserTools"):
-            continue
-
-        for fn in node.body:
-            if not isinstance(fn, ast.FunctionDef):
-                continue
-            is_discoverable = False
-            tool_type: Optional[str] = None
-            for dec in fn.decorator_list:
-                if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
-                    if dec.func.id == "is_discoverable_tool":
-                        is_discoverable = True
-                        if dec.args and isinstance(dec.args[0], ast.Attribute):
-                            tool_type = dec.args[0].attr  # e.g. "WRITE"
-                        break
-            if not is_discoverable:
-                continue
-
-            doc = ast.get_docstring(fn) or ""
-            entry = {
-                "name": fn.name,
-                "type": tool_type or "UNKNOWN",
-                "params": [a.arg for a in fn.args.args[1:]],  # skip self
-                "doc": doc,
-                "doc_first_line": doc.split("\n", 1)[0].strip() if doc else "",
-            }
-            if node.name == "KnowledgeTools":
-                agent.append(entry)
-            else:
-                user.append(entry)
-
-    by_name = {e["name"]: e for e in agent + user}
-    return {"agent": agent, "user": user, "by_name": by_name}
-
-
-def _render_catalog_for_prompt(catalog: dict, max_doc_chars: int = 140) -> str:
-    """Render the catalog as a compact prompt section.
-
-    Groups agent tools by READ/WRITE/GENERIC. Keeps each entry to one line
-    with name, params, and a truncated one-line description. Embeds the
-    full list of 4 user-side tools under their own heading.
-
-    ~3000 tokens total — compact enough to coexist with the base prompt
-    while giving the LLM complete visibility into the tool surface.
-    """
-    agent = catalog.get("agent", [])
-    user = catalog.get("user", [])
-
-    if not agent and not user:
-        return ""
-
-    by_type: dict[str, list[dict]] = {"READ": [], "WRITE": [], "GENERIC": []}
-    for t in agent:
-        by_type.setdefault(t["type"], []).append(t)
-
-    lines: list[str] = []
-    lines.append("## Discoverable tool catalog")
-    lines.append("")
-    lines.append(
-        f"Exactly {len(agent)} agent-side tools exist (unlock via "
-        f"`unlock_discoverable_agent_tool(agent_tool_name=<name>)`) and "
-        f"{len(user)} user-side tools (give via "
-        f"`give_discoverable_user_tool(discoverable_tool_name=<name>)`). "
-        f"These are the ONLY discoverable tool names that exist — do NOT "
-        f"invent or guess any other names."
-    )
-    lines.append("")
-
-    def short(entry: dict) -> str:
-        params = ", ".join(entry["params"]) if entry["params"] else ""
-        desc = entry["doc_first_line"][:max_doc_chars]
-        return f"- `{entry['name']}({params})` — {desc}"
-
-    if by_type.get("READ"):
-        lines.append(f"### Agent READ tools ({len(by_type['READ'])})")
-        for t in sorted(by_type["READ"], key=lambda x: x["name"]):
-            lines.append(short(t))
-        lines.append("")
-    if by_type.get("WRITE"):
-        lines.append(f"### Agent WRITE tools ({len(by_type['WRITE'])})")
-        for t in sorted(by_type["WRITE"], key=lambda x: x["name"]):
-            lines.append(short(t))
-        lines.append("")
-    if by_type.get("GENERIC"):
-        lines.append(f"### Agent GENERIC tools ({len(by_type['GENERIC'])})")
-        for t in sorted(by_type["GENERIC"], key=lambda x: x["name"]):
-            lines.append(short(t))
-        lines.append("")
-
-    if user:
-        lines.append(f"### User-side tools ({len(user)}) — call give_discoverable_user_tool")
-        for t in sorted(user, key=lambda x: x["name"]):
-            lines.append(short(t))
-        lines.append("")
-
-    lines.append(
-        "**When you know which tool you need from this catalog, you can unlock/give "
-        "it directly without having to find it via KB_search. Still use KB_search to "
-        "read the relevant procedure/policy doc for preconditions and enum constraints.**"
-    )
-
-    return "\n".join(lines)
-
-
-_DISCOVERABLE_CATALOG = _parse_discoverable_catalog()
-_CATALOG_PROMPT_SECTION = _render_catalog_for_prompt(_DISCOVERABLE_CATALOG)
-_VALID_DISCOVERABLE_NAMES: set[str] = set(_DISCOVERABLE_CATALOG.get("by_name", {}).keys())
+    if source_path is None:
+        return COMPASS.catalog
+    from compass import ToolCompass
+    # Explicit path requested — build a one-off compass (used for the
+    # missing-file safety test).
+    return ToolCompass(tools_path=source_path).catalog
 
 # ── PROMPTS ──────────────────────────────────────────────────────────────────
 
