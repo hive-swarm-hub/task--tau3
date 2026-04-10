@@ -14,12 +14,17 @@ import json
 import os
 import re
 import time
+from typing import Optional
 
 from litellm import completion
 
-from tau2.agent.base import LocalAgent, ValidAgentInputMessage
-from tau2.agent.llm_agent import LLMAgent, LLMAgentState
+# τ²-bench v1.0.0 restructured the agent API:
+#   - LocalAgent → HalfDuplexAgent (now in tau2.agent.base_agent)
+#   - LLMAgent subclass is no longer required; we extend HalfDuplexAgent directly
+#   - ValidAgentInputMessage moved to tau2.agent.base_agent
+from tau2.agent.base_agent import HalfDuplexAgent, ValidAgentInputMessage
 from tau2.data_model.message import (
+    APICompatibleMessage,
     AssistantMessage,
     Message,
     MultiToolMessage,
@@ -270,7 +275,23 @@ MAX_RETRIES = 3
 LOOP_BREAK_LIMIT = 5  # Force text response after N consecutive tool calls to break search loops
 
 
-class CustomAgent(LLMAgent):
+class BankingAgentState:
+    """Per-task conversation state for CustomAgent.
+
+    Decoupled from τ²-bench internals so future API changes don't force us
+    to refactor — we just need fields our generate_next_message uses.
+    """
+
+    def __init__(
+        self,
+        system_messages: list,
+        messages: Optional[list] = None,
+    ):
+        self.system_messages = list(system_messages)
+        self.messages = list(messages) if messages else []
+
+
+class CustomAgent(HalfDuplexAgent[BankingAgentState]):
     """Self-contained banking knowledge customer service agent.
 
     The class provides three extension points for swarm agents to build on
@@ -295,8 +316,14 @@ class CustomAgent(LLMAgent):
     framework agents use to pick what to work on.
     """
 
-    def __init__(self, tools: list[Tool], domain_policy: str, llm=None, llm_args=None):
-        LocalAgent.__init__(self, tools=tools, domain_policy=domain_policy)
+    def __init__(
+        self,
+        tools: list[Tool],
+        domain_policy: str,
+        llm: Optional[str] = None,
+        llm_args: Optional[dict] = None,
+    ):
+        super().__init__(tools=tools, domain_policy=domain_policy)
         self.llm = llm or os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
         self.llm_args = dict(llm_args or {})
         self._consecutive_tool_calls = 0
@@ -408,15 +435,22 @@ class CustomAgent(LLMAgent):
 
     # ── main loop ────────────────────────────────────────────────────────
 
-    def get_init_state(self, message_history=None) -> LLMAgentState:
+    def get_init_state(
+        self,
+        message_history: Optional[list[Message]] = None,
+    ) -> BankingAgentState:
         # tau2-bench calls this once per task — perfect place to reset state
         self._reset_task_state()
-        return LLMAgentState(
+        return BankingAgentState(
             system_messages=[SystemMessage(role="system", content=self.system_prompt)],
             messages=list(message_history or []),
         )
 
-    def generate_next_message(self, message: ValidAgentInputMessage, state: LLMAgentState):
+    def generate_next_message(
+        self,
+        message: ValidAgentInputMessage,
+        state: BankingAgentState,
+    ) -> tuple[AssistantMessage, BankingAgentState]:
         # 1. Append incoming message(s) to conversation history
         if isinstance(message, MultiToolMessage):
             state.messages.extend(message.tool_messages)
@@ -478,3 +512,23 @@ class CustomAgent(LLMAgent):
 
     def set_seed(self, seed: int):
         self.llm_args["seed"] = seed
+
+
+# ── FACTORY ───────────────────────────────────────────────────────────────────
+# τ²-bench v1.0.0 uses a factory-function registration pattern.
+# The factory signature is: factory(tools, domain_policy, **kwargs) -> agent.
+
+def create_custom_agent(
+    tools: list[Tool],
+    domain_policy: str,
+    llm: Optional[str] = None,
+    llm_args: Optional[dict] = None,
+    **kwargs,
+) -> CustomAgent:
+    """Factory function used by tau2's registry.register_agent_factory."""
+    return CustomAgent(
+        tools=tools,
+        domain_policy=domain_policy,
+        llm=llm,
+        llm_args=llm_args,
+    )

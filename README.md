@@ -13,11 +13,51 @@ The **primary optimization lever** is `agent.py:annotate_banking()` — the only
 ## Quick start
 
 ```bash
-bash prepare.sh                    # install τ²-bench with knowledge extras
-export SOLVER_MODEL=gpt-4.1-mini   # or your preferred model
-export OPENAI_API_KEY=...
-bash eval/eval.sh                  # run full evaluation + auto-extract traces
+# 1. Install τ²-bench and configure your API key (interactive)
+bash prepare.sh
+# prepare.sh will:
+#   - clone tau2-bench with knowledge extras
+#   - create .env from .env.example
+#   - prompt you to paste your OPENAI_API_KEY (hidden input, written to .env)
+
+# 2. Run the evaluation
+bash eval/eval.sh
+
+# Fast iteration: run 10% of tasks instead of all 97
+SAMPLE_FRAC=0.1 bash eval/eval.sh
 ```
+
+The `.env` file is gitignored — your key stays local. `eval/eval.sh` auto-sources `.env` before every run.
+
+If you prefer to edit `.env` manually instead of using the prompt:
+
+```bash
+cp .env.example .env
+# Open .env in your editor and replace sk-... with your real key
+```
+
+Or export it as an environment variable instead of using `.env`:
+
+```bash
+export OPENAI_API_KEY=sk-...
+bash eval/eval.sh
+```
+
+## Testing
+
+Two standalone test suites (run before touching `extract_traces.py` or `annotate_banking()`):
+
+```bash
+# Test extract_traces.py logic — stdlib only, no τ²-bench needed
+python eval/test_extract_traces.py
+
+# Test annotate_banking() — requires bash prepare.sh to have run
+python eval/test_annotator.py
+```
+
+`test_extract_traces.py` covers 12 cases for the `discoverable_tool_analysis` pipeline: happy path, missing unlock (the primary banking failure), called without unlock, wasted unlock, unlocked without mention, give to user, multiple tools, empty messages, regex edge cases, ground truth extraction, end-to-end trace, and conversation truncation.
+
+`test_annotator.py` covers 11 cases for `annotate_banking()`: discoverable tool mentions, user-facing action indicators, verification requirements, multi-step procedures, cross-references, and the combinations.
 
 ## Tracing
 
@@ -39,18 +79,20 @@ See `traces/latest.json` for per-task conversation transcripts, tool call correc
 
 ## Start here
 
-1. Read `.agent/learnings.md` — what the swarm has already discovered
-2. Read `program.md` — the full experiment loop and meta-improvement protocol
-3. Read `agent.py:annotate_banking()` — the primary optimization lever
-4. Run baseline: `bash eval/eval.sh`
-5. Read `traces/latest.json` to see what's failing
-6. Edit `agent.py`, commit, re-run
+1. **Read `AGENTS.md` first** — environmental facts document. Every fact in there (the 23 TransactionalDB tables, the 48 agent-side + 4 user-side discoverable tools, the trap tool, user simulator behavior, verification mechanics) saves you a wasted experiment.
+2. Read `.agent/learnings.md` — what the swarm has already discovered
+3. Read `program.md` — the full experiment loop and meta-improvement protocol
+4. Read `agent.py:annotate_banking()` — the primary optimization lever
+5. Run baseline: `bash eval/eval.sh`
+6. Read `traces/latest.json` to see what's failing
+7. Edit `agent.py`, commit, re-run
 
 ## Hive
 
 ```bash
 hive clone tau3-banking
 bash prepare.sh
+cp .env.example .env    # paste your key
 # Read program.md, then start experimenting
 ```
 

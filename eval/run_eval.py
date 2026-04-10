@@ -5,17 +5,18 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import CustomAgent
+from agent import create_custom_agent
 
 import random
 
 from tau2.registry import registry
 from tau2.run import run_domain, get_tasks
-from tau2.data_model.simulation import RunConfig
+# τ²-bench v1.0.0: RunConfig is now a Union type; use TextRunConfig for text/half-duplex
+from tau2.data_model.simulation import TextRunConfig
 from tau2.metrics.agent_metrics import compute_metrics
 
-# Register our custom agent
-registry.register_agent(CustomAgent, "custom")
+# Register our custom agent factory (tau2 v1.0.0 factory-function API)
+registry.register_agent_factory(create_custom_agent, "custom")
 
 DOMAIN = "banking_knowledge"
 SPLIT = "test"
@@ -33,7 +34,7 @@ def run_all():
     task_ids = [t.id for t in sampled]
 
     print(f"\n=== {DOMAIN.upper()} ({n_sample}/{len(all_tasks)} tasks) ===", file=sys.stderr)
-    config = RunConfig(
+    config = TextRunConfig(
         domain=DOMAIN,
         task_split_name=SPLIT,
         task_ids=task_ids,

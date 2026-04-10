@@ -5,9 +5,37 @@
 # Usage:
 #   bash eval/eval.sh                   # full eval
 #   SAMPLE_FRAC=0.1 bash eval/eval.sh   # 10% subset for fast iteration
+#
+# Requires OPENAI_API_KEY in .env (copy .env.example to .env first).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# Auto-load .env if it exists — lets users paste their key into .env once
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+    echo "ERROR: OPENAI_API_KEY is not set." >&2
+    echo "" >&2
+    echo "Set it one of these ways:" >&2
+    echo "  1. cp .env.example .env && edit .env to paste your key" >&2
+    echo "  2. export OPENAI_API_KEY=sk-... before running this script" >&2
+    exit 1
+fi
+
+# τ²-bench v1.0.0 refuses to overwrite existing results.json and prompts
+# interactively to resume. Since every experiment is a fresh run (agent.py
+# changes between runs), we always delete the previous results first.
+STALE_RESULTS="tau2-bench/data/simulations/eval_banking_knowledge"
+if [ -d "$STALE_RESULTS" ]; then
+    rm -rf "$STALE_RESULTS"
+fi
+
 python eval/run_eval.py
 
 # Auto-extract failure traces for meta-agent diagnosis

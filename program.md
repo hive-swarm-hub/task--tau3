@@ -5,16 +5,21 @@ Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banki
 ## Setup
 
 1. **Create your branch**: `git checkout -b hive/<your-agent-id>` from current main.
-2. **Read the in-scope files**:
+2. **Read AGENTS.md first** — this is the environmental facts document. It contains
+   everything we know about the τ³ banking_knowledge environment (the 23 TransactionalDB
+   tables, the 48 agent-side + 4 user-side discoverable tools, the trap tool, user
+   simulator behavior, verification mechanics, etc.). Do not skip this — every fact in
+   there saves you a wasted experiment.
+3. **Read the in-scope files**:
    - `agent.py` — the file you modify. Single-file banking agent with `annotate_banking()` as the primary optimization lever.
    - `eval/eval.sh` — runs evaluation + auto-extracts failure traces. Do not modify.
    - `eval/run_eval.py` — evaluation runner. Do not modify.
    - `eval/extract_traces.py` — trace extractor. Do not modify.
    - `prepare.sh` — installs τ²-bench with knowledge extras. Do not modify.
-3. **Run prepare**: `bash prepare.sh` to install τ²-bench.
-4. **Initialize results.tsv**: Create `results.tsv` with just the header row.
-5. **Read existing learnings**: `cat .agent/learnings.md` — see what the swarm has already discovered.
-6. **Confirm and go**: Run the baseline, then start the experiment loop.
+4. **Run prepare**: `bash prepare.sh` to install τ²-bench.
+5. **Initialize results.tsv**: Create `results.tsv` with just the header row.
+6. **Read existing learnings**: `cat .agent/learnings.md` — see what the swarm has already discovered.
+7. **Confirm and go**: Run the baseline, then start the experiment loop.
 
 ## The benchmark
 
@@ -53,16 +58,7 @@ The current skeleton detects:
 4. Multi-step procedures
 5. Cross-references to other docs
 
-**Evolve it.** The annotator is intentionally simple so you can see what to add. Read `traces/latest.json`, find the most common failure mode, and add an annotation that surfaces the missing signal.
-
-### Recommended experiments
-
-- **Refine the tool name regex** — the current `[a-z_]+_\d{4,}` might miss some patterns
-- **Add boilerplate stripping** — banking KB docs have repeated headers/footers that eat attention budget
-- **Stateful cross-turn tracking** — track which tools have been mentioned vs unlocked across the conversation; requires making the annotator stateful (override `generate_next_message` in `CustomAgent`)
-- **Pre-flight discovery** — on the first user message, automatically call `list_discoverable_agent_tools` (override `get_init_state`)
-- **Retrieval query rewriting** — if you see repeated failed searches in traces, maybe preprocess the query (though the annotator runs on results, not queries, so this requires a different hook)
-- **Policy extraction** — detect policy rules embedded in KB docs and surface them as clear "ELIGIBILITY RULES" blocks
+**Evolve it.** The annotator is intentionally simple so you can see what to add. Read `traces/latest.json`, find the most common failure class per the Priority framework below, and add an annotation that surfaces the missing signal.
 
 ## Experimentation
 
@@ -235,7 +231,7 @@ Failures in banking_knowledge cluster into four classes, ordered by causal depen
 
 Deterministic blockers (P1) → exact-equality failures (P2) → probabilistic retrieval (P3) → cross-cutting discipline (P4). Each earlier priority masks later ones. If P1 is dominant, fixing P2/P3/P4 won't move the score because tasks still die at the gate.
 
-Backed by τ-Knowledge paper findings: even with oracle retrieval (`golden_retrieval` config), pass^1 only rises to ~40% — procedural correctness is the dominant failure driver, not retrieval. Agent-side discipline (gating, provenance, argument fidelity) matters more than retrieval configuration. See `/Users/hansonxiong/Downloads/deep-research-report (2).md` for the full research.
+Backed by τ-Knowledge paper findings: even with oracle retrieval (`golden_retrieval` config), pass^1 only rises to ~40% — procedural correctness is the dominant failure driver, not retrieval. Agent-side discipline (gating, provenance, argument fidelity) matters more than retrieval configuration.
 
 ### Experiment selection heuristic
 
