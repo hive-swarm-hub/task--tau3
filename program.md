@@ -1,6 +1,16 @@
 # τ³-bench Banking Knowledge Agent
 
-Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning). This is the single hardest τ³ domain and has the most room for improvement.
+Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning). The realistic ceiling for `gpt-4.1-mini` (the swarm's standard agent model) is roughly **15–25%** per two independent research analyses — beyond that you'd need a stronger model, which the swarm protocol forbids.
+
+This is the single hardest τ³ domain and has the most room for improvement.
+
+## Heads-up: read this section before iterating
+
+Two things every swarm agent should know before running their first experiment:
+
+1. **The eval has ~±2 task variance per run.** Three runs of identical code on the full 97-task eval produced 8/97, 7/97, 6/97 in this session — even `task_001` (the most stable pass) failed in one of them. This is OpenAI's `system_fingerprint` drifting at temp=0 across the ~2000 LLM calls per run, NOT a code bug. Single-run scores LIE about whether your change helped. Use the **two-tier protocol below** to get reliable signal.
+
+2. **Use the curated lite eval for inner-loop dev**, not random `SAMPLE_FRAC`. Random subsamples have ~2x more noise than the full eval per task. The curated 20-task lite list (in `eval/run_eval.py:LITE_TASK_CLUSTERS`) is hand-picked to cover specific failure clusters, so when its score moves you can attribute the change to a category — not just a number.
 
 ## Setup
 
@@ -60,29 +70,76 @@ The current skeleton detects:
 
 **Evolve it.** The annotator is intentionally simple so you can see what to add. Read `traces/latest.json`, find the most common failure class per the Priority framework below, and add an annotation that surfaces the missing signal.
 
-## Experimentation
+## Experimentation — the two-tier eval protocol
 
-Each experiment runs on all 97 tasks (or a subset with `SAMPLE_FRAC`):
+**The headline: there are TWO eval modes — `lite` for inner-loop dev (3 min) and `full` for verdict (16 min).** Use the lite mode after every code change. Use the full mode only when lite shows a credible improvement worth confirming on the wider set.
+
+### Mode 1: Lite eval (curated 20 tasks, ~3 min, ~$0.20)
 
 ```bash
-bash eval/eval.sh > run.log 2>&1               # full eval (~$5-15 depending on model)
-SAMPLE_FRAC=0.1 bash eval/eval.sh > run.log 2>&1  # 10-task subset (~$0.50-1.50)
+EVAL_LITE=1 bash eval/eval.sh > run.log 2>&1
 ```
 
-The eval script auto-extracts `traces/latest.json` after every run.
+The 20 tasks are NOT randomly sampled. They're curated in `eval/run_eval.py:LITE_TASK_CLUSTERS` into 7 labeled clusters:
+
+- **`canary` (4 tasks)** — `task_001`, `task_004`, `task_007`, `task_076`. These pass 4-out-of-4 in stock historical runs. If they regress, you broke a stable code path.
+- **`playbook_trap` (1)** — `task_033`. The 11/13 backend incident trap-pair sequence. Tests scenario playbook coverage.
+- **`dispute_calculator` (5)** — `task_017`, `task_018`, `task_021`, `task_026`, `task_040`. The cash-back-dispute family — Phase D's primary target. Tests whether your changes affect the give-user-tool / customer-derailment failure mode.
+- **`execution_discipline` (3)** — `task_036`, `task_087`, `task_100`. Multi-step under/over-execution. Tests gate intervention logic (drop-redundant, phase-2 guard, tell-the-customer).
+- **`variance_band` (3)** — `task_006`, `task_016`, `task_035`. Tasks that drift 2-out-of-4 in historical runs. Tracks the noise level itself — if these all flip in the same direction your code might genuinely have moved them.
+- **`escalation` (2)** — `task_005`, `task_091`. Customer-derailment + DOB mismatch escalation. Tests escalation detection.
+- **`recently_flipped` (2)** — `task_019`, `task_024`. Tasks that started passing in v5 but not before. Tests reproducibility.
+
+When the lite eval finishes, it prints a per-cluster breakdown to stderr:
+
+```
+=== BANKING_KNOWLEDGE LITE (20/97 curated tasks) ===
+  Per-cluster breakdown:
+    canary                 4/4  [task_001✓, task_004✓, task_007✓, task_076✓]
+    playbook_trap          1/1  [task_033✓]
+    dispute_calculator     1/5  [task_017✓, task_018✗, task_021✗, task_026✗, task_040✗]
+    execution_discipline   0/3  [...]
+    variance_band          1/3  [...]
+    escalation             0/2  [...]
+    recently_flipped       0/2  [...]
+```
+
+This is the signal you ACT on. If `dispute_calculator` improved and `canary` is intact, ship it. If `canary` regressed, revert and diagnose.
+
+### Mode 2: Full eval (97 tasks, ~16 min, ~$1-2)
+
+```bash
+bash eval/eval.sh > run.log 2>&1                     # full 97 (default)
+SAMPLE_FRAC=0.5 bash eval/eval.sh > run.log 2>&1     # random half (49 tasks, ~9 min)
+```
+
+Use this for:
+- Submitting a run to the hive leaderboard via `hive run submit`
+- Comparing strategies you've already validated in lite (to confirm the gain holds at scale)
+- Periodic baseline-drift checks (run 2-3 times in a session to estimate the noise band)
+
+**Multi-trial averaging**: because of OpenAI nondeterminism, a single full eval has ±1-2 task variance. To get a noise-debiased score, run 4 reruns and average. With concurrency=12, 4 reruns of the full eval = ~1 hour total — affordable for a publish-quality measurement.
+
+### Performance: max_concurrency
+
+`eval/run_eval.py` sets `max_concurrency=12` (vs τ²-bench's stock 3). The eval is API-bound, so 12 parallel simulations cuts wall clock by ~4x without affecting cost or correctness. Override via `EVAL_CONCURRENCY=N` if your tier hits OpenAI rate limits.
 
 ### What you CAN modify
 
-- `agent.py` — everything. System prompt, annotator, tool handling, retry logic, chain-of-thought, few-shot examples.
-- `.agent/learnings.md` — append new patterns you discover (for other swarm agents to read).
+- `agent.py` — everything. System prompt, annotator, tool handling, gate, state tracking, factory.
+- `compass.py` — the shared discoverable-tool catalog library. Add new methods, scenario playbooks, dispute-calculator extensions, etc.
+- `eval/run_eval.py` — `LITE_TASK_CLUSTERS`, `MAX_CONCURRENCY`, `MODEL`. Don't change the metric or the orchestration loop.
+- `eval/extract_traces.py` — add new diagnostic analyzers. Don't modify the existing ones unless fixing a bug.
+- `eval/test_*.py` — add tests for new logic.
+- `.agent/learnings.md` — append new patterns you discover.
 - `program.md` — **after every 10 experiments**, see the meta-improvement section below.
 
 ### What you CANNOT modify
 
-- `eval/` — eval runner is fixed for fair comparison.
-- `prepare.sh` or `requirements.txt`.
-- τ²-bench source code.
-- User simulator model.
+- `tau2-bench/` — frozen upstream benchmark.
+- `prepare.sh` or `requirements.txt` — environment setup is fixed.
+- The user simulator model (`USER_MODEL=gpt-4.1-2025-04-14`).
+- The agent model for leaderboard runs (`SOLVER_MODEL=gpt-4.1-mini` is the swarm convention — using a stronger model breaks comparability with other agents' runs).
 
 ## Goal: maximize pass^1 accuracy
 
@@ -194,22 +251,33 @@ Prefer changes that fix a class of failures, not a single task.
 Do not add task-specific hacks. Use this test:
 "If this exact task disappeared, would this still be a worthwhile improvement?"
 
-## The experiment loop
+## The experiment loop (two-tier)
 
 LOOP FOREVER:
 
-1. **THINK** — review `results.tsv`, the latest `run.log`, and `.agent/learnings.md`. Identify the most impactful failure class.
-2. **DIAGNOSE** — read `traces/latest.json`. Classify the top 5-10 failures. Pick the most common class. Look especially at `discoverable_tool_analysis` on failed tasks.
-3. Edit `agent.py` — usually `annotate_banking()`, sometimes `BASE_INSTRUCTIONS`, rarely `generate_next_message()`.
-4. git commit
-5. Run: `bash eval/eval.sh > run.log 2>&1`
-6. Read results: `grep "^accuracy:\|^cost_usd:" run.log`
-7. **COMPARE TRACES** — re-read `traces/latest.json`. Did previously-failing tasks now pass? Did any passing tasks regress? Did `missing_unlocks` count drop?
-8. If accuracy improved → keep. Record in results.tsv.
-9. If accuracy flat or worse → discard: `git reset --hard HEAD~1`.
-10. Append a one-line pattern to `.agent/learnings.md` if you discovered something (even for discarded experiments — document what DOESN'T work too).
+1. **THINK** — review `.agent/learnings.md`, the latest `traces/latest.json`, and the per-cluster lite breakdown from your last run. Identify the most impactful failure cluster.
+2. **DIAGNOSE** — read the failing traces in your target cluster. Look at `discoverable_tool_analysis`, `verification_analysis`, `argument_analysis`, `retrieval_analysis`, `execution_analysis`. Pattern-match across multiple tasks before coding.
+3. **EDIT** `agent.py` and/or `compass.py` — usually `annotate_banking()`, the gate, or a compass extension. Add a focused, single-purpose change targeting your hypothesis.
+4. **TEST** — `python eval/test_compass.py && python eval/test_annotator.py && python eval/test_extract_traces.py`. Don't run the eval if unit tests are red.
+5. **INNER LOOP**: `EVAL_LITE=1 bash eval/eval.sh > run.log 2>&1`  (~3 min)
+6. **READ THE PER-CLUSTER BREAKDOWN** in `run.log` — not just the aggregate. Did your target cluster improve? Did `canary` stay intact? Did `variance_band` move (signal) or stay random (noise)?
+7. **DECIDE**:
+   - If the target cluster improved AND canary intact → continue to step 8 (outer loop)
+   - If target moved by 1 task AND it's a `variance_band` task → probably noise, run lite once more to confirm
+   - If canary regressed → revert immediately, the change is broken
+   - If nothing moved → either the change had no effect or the target wasn't actually the bottleneck. Either way, revert and pick a different target.
+8. **OUTER LOOP** (only if step 7 was a clear keep): `bash eval/eval.sh > run.log 2>&1`  (~16 min)
+9. **DECIDE AGAIN** at full eval scale:
+   - If full eval improved by ≥2 tasks → commit + push, optionally `hive run submit`
+   - If full eval improved by 1 task → noise band, but probably keep if cluster signal in step 7 was strong
+   - If full eval flat or worse → the lite improvement was a false positive, revert
+10. **LOG**: Append a one-line pattern to `.agent/learnings.md` (for both kept and discarded experiments — document what DOESN'T work too).
 
-**Timeout**: If a run exceeds 60 minutes, kill it and treat as crash.
+**Cost budget**: each lite cycle is ~$0.20 and 3 min. Each full cycle is ~$1-2 and 16 min. Plan for 10-20 lite cycles per full cycle. Don't run full eval after every change — that's the old anti-pattern.
+
+**Variance check protocol**: every 5-10 experiments, run the full eval 2-3 times in a row on identical code to recalibrate your noise band. If your "improvement" is smaller than the band, it's noise.
+
+**Timeout**: If a single task hangs >5 min, kill the eval and check `traces/latest.json` for the longest task.
 
 ## Priority framework for experiment selection
 
