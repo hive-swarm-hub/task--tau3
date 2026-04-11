@@ -293,6 +293,29 @@ def annotate_banking(content: str, state: dict | None = None) -> str:
                 )
                 break
 
+        # COMMIT 1: stronger nudge when ANY mentioned tool is in the user-side
+        # catalog (compass). The 4 user-side tools are statically known —
+        # if a KB result mentions one, the agent should give it via
+        # give_discoverable_user_tool, period.
+        try:
+            user_side_tools = {e["name"] for e in _DISCOVERABLE_CATALOG.get("user", [])}
+        except (TypeError, AttributeError):
+            user_side_tools = set()
+        user_side_in_doc = sorted(t for t in tool_mentions if t in user_side_tools)
+        if user_side_in_doc:
+            already_given = (state or {}).get("unlocked_for_user", set()) or set()
+            still_to_give = [t for t in user_side_in_doc if t not in already_given]
+            if still_to_give:
+                annotations.append(
+                    f"USER-SIDE TOOL REQUIRED: this document references {', '.join(still_to_give)} "
+                    f"which is in the user-side discoverable catalog. You MUST call "
+                    f"give_discoverable_user_tool(discoverable_tool_name='<name>') for each. "
+                    f"Then tell the customer the EXACT argument values to provide — pull any "
+                    f"required IDs from get_* tool results first. Do NOT call an agent-side "
+                    f"equivalent like update_transaction_rewards_NNNN; the oracle expects the "
+                    f"customer to perform this action via the user-side tool."
+                )
+
     # 2. Flag identity verification requirements — but warn if already verified
     if ("verify" in content_lower and "identity" in content_lower) or "log_verification" in content:
         already_verified = bool((state or {}).get("verified_user_ids"))
@@ -344,6 +367,23 @@ def annotate_banking(content: str, state: dict | None = None) -> str:
                 f"{', '.join(repr(e) for e in enums[:8])}. "
                 f"Pass these EXACTLY — arg matching is strict equality."
             )
+
+    # COMMIT 1: live user-side compliance status. When the customer has been
+    # given a user-side tool, surface the running count of user calls so the
+    # LLM can see how many disputes/submissions have actually landed and
+    # decide whether to prompt the customer for the next one.
+    user_calls_by_tool = (state or {}).get("user_calls_by_tool", {}) or {}
+    unlocked_for_user_set = (state or {}).get("unlocked_for_user", set()) or set()
+    if unlocked_for_user_set:
+        status_lines = []
+        for utool in sorted(unlocked_for_user_set):
+            n = user_calls_by_tool.get(utool, 0)
+            status_lines.append(f"  - {utool}: customer has called it {n} time(s)")
+        annotations.append(
+            "USER TOOL STATUS:\n" + "\n".join(status_lines) +
+            "\nIf the task needs more submissions, prompt the customer to call the tool again "
+            "with the next required argument values. Do NOT call an agent-side equivalent."
+        )
 
     # 6. Escalation / dispute trigger phrases
     escalation_triggers = [
@@ -511,6 +551,13 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             "unlocked_for_user": set(),     # names given via give_discoverable_user_tool
             "kb_search_count": 0,           # how many KB_search calls have been made
             "gate_interventions": [],       # log of _gate_tool_calls rewrites (for debugging)
+            # Commit 1 additions: user-side compliance tracking
+            "user_calls_by_tool": {},       # {discoverable_tool_name: count} — populated when
+                                            # we observe a tool result for a user-side execution
+            "transactions_by_user": {},     # {user_id: [txn_records]} — cached from
+                                            # get_credit_card_transactions_by_user so the gate
+                                            # can suggest exact arg values to the customer
+            "current_user_id": None,        # most recent verified user_id (for prompt templating)
         }
         self._consecutive_tool_calls = 0
 
@@ -546,6 +593,7 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                     user_id = args.get("user_id")
                     if user_id:
                         self._task_state["verified_user_ids"].add(user_id)
+                        self._task_state["current_user_id"] = user_id
                 elif tc.name == "unlock_discoverable_agent_tool":
                     target = args.get("agent_tool_name") or args.get("tool_name")
                     if target:
@@ -556,6 +604,14 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                         self._task_state["unlocked_for_user"].add(target)
                 elif tc.name in ("KB_search", "kb_search", "search_knowledge_base"):
                     self._task_state["kb_search_count"] += 1
+                elif tc.name == "get_user_information_by_id":
+                    uid = args.get("user_id")
+                    if uid:
+                        self._task_state["current_user_id"] = uid
+                elif tc.name == "get_credit_card_transactions_by_user":
+                    uid = args.get("user_id")
+                    if uid:
+                        self._task_state["current_user_id"] = uid
 
         # Parse incoming tool results and accumulate KB mentions
         tool_messages = []
@@ -564,11 +620,44 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
         elif isinstance(incoming, MultiToolMessage):
             tool_messages = list(incoming.tool_messages)
 
+        # Find the most recent outgoing call name to pair with these results
+        last_call_name = None
+        if self._task_state["tool_call_ledger"]:
+            last_call_name = self._task_state["tool_call_ledger"][-1]["name"]
+
         for tm in tool_messages:
             content = tm.content or ""
             # Accumulate discoverable tool mentions from KB results
             for name in _DISCOVERABLE_TOOL_PATTERN.findall(content):
                 self._task_state["mentioned_in_kb"].add(name)
+
+            # COMMIT 1: detect user-side tool executions in incoming results.
+            # When the customer simulator calls a discoverable tool we gave it,
+            # the tau2 environment runs the tool and the RESULT comes back as
+            # a ToolMessage even though the tool CALL message itself is hidden
+            # from the agent. We can recognize these results by looking for
+            # the "Executed: <name>" / "Tool called: <name>" signature where
+            # <name> matches a tool in unlocked_for_user.
+            for m in re.finditer(
+                r"(?:Executed|Tool called|Called|called)\s*[:`]\s*`?([a-z][a-z_]+_\d{4,})`?",
+                content,
+            ):
+                tool_name = m.group(1)
+                if tool_name in self._task_state.get("unlocked_for_user", set()):
+                    counts = self._task_state.setdefault("user_calls_by_tool", {})
+                    counts[tool_name] = counts.get(tool_name, 0) + 1
+
+            # COMMIT 1: cache transaction lookups so the gate can suggest exact
+            # transaction_id values when prompting the customer. The result of
+            # get_credit_card_transactions_by_user is plain text with one
+            # numbered record per transaction; we extract just the txn IDs.
+            if last_call_name == "get_credit_card_transactions_by_user":
+                txn_ids = re.findall(r"\btransaction_id:\s*([a-z0-9_]{8,})", content)
+                if txn_ids:
+                    uid = self._task_state.get("current_user_id")
+                    if uid:
+                        self._task_state.setdefault("transactions_by_user", {})[uid] = txn_ids
+
             # Parse JSON result if possible; pair with most recent tool call by position
             try:
                 parsed = json.loads(content)
@@ -604,6 +693,25 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
            τ²-bench requires the `arguments` parameter to be a JSON-encoded
            STRING, not a dict. LiteLLM may silently pass `{}`, causing the
            target tool to effectively no-op. We JSON-encode on the fly.
+
+        D. HALLUCINATION GUARD — drop unlock/give of names not in the catalog.
+
+        E. PHASE-2 GUARD (Commit 1) — block agent-side cleanup tools that
+           pair with a still-pending user-side tool. The classic failure
+           pattern (task_026): agent gives `submit_cash_back_dispute_0589`
+           to the user, customer submits 1 of 6 expected disputes, then
+           Phase-2 customer message asks for direct rewards update; the
+           agent complies with `update_transaction_rewards_3847` even
+           though only 1 of 6 is in. We block the cleanup until the
+           user-side counter looks complete (or until the agent has
+           waited several turns for the customer).
+
+        F. POST-GIVE TELL-THE-CUSTOMER (Commit 1) — when the LLM calls
+           `give_discoverable_user_tool(X)`, append a templated reminder
+           to the assistant content telling the LLM to follow up with the
+           specific argument values the customer needs. This nudges the
+           agent toward providing concrete txn_ids instead of vague
+           "please submit your dispute" prompts.
 
         The gate NEVER adds calls the LLM didn't request, and NEVER changes
         tool names. It only removes redundant calls and reformats args.
@@ -699,7 +807,90 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                         "target": args.get("agent_tool_name", "?"),
                     })
 
+            # Intervention E (Commit 1): Phase-2 guard.
+            # If the agent is about to call an agent-side mutation that pairs
+            # with a still-pending user-side tool, block it. "Pairs" means:
+            # the agent gave a user-side tool whose semantic family overlaps
+            # with the agent-side tool the LLM is now invoking, AND the
+            # user-side counter says the customer hasn't called it enough
+            # times yet.
+            #
+            # Concrete pairing rules (tight to avoid false positives):
+            #   user gave: submit_cash_back_dispute_0589
+            #     blocks agent: update_transaction_rewards_*  (the cleanup pair)
+            #   user gave: deposit_check_3847
+            #     blocks agent: apply_*_account_credit_*      (the same idea)
+            #
+            # If the user has called the user-side tool at least once we let
+            # the agent-side cleanup through (the customer might really be
+            # done after one call, e.g., a single-transaction dispute).
+            # The check fires only when zero user-side calls have been
+            # observed since the give — that's the hardest signal of
+            # premature Phase-2 cleanup.
+            phase2_pairs = {
+                "submit_cash_back_dispute_0589": ("update_transaction_rewards_",),
+                "deposit_check_3847": ("apply_checking_account_credit_", "apply_savings_account_credit_"),
+            }
+            if name == "call_discoverable_agent_tool" and isinstance(args, dict):
+                target_tool = args.get("agent_tool_name") or ""
+                user_calls = self._task_state.get("user_calls_by_tool", {})
+                blocked = False
+                for given_tool, agent_prefixes in phase2_pairs.items():
+                    if given_tool not in unlocked_user:
+                        continue
+                    if any(target_tool.startswith(p) for p in agent_prefixes):
+                        if user_calls.get(given_tool, 0) == 0:
+                            log.append({
+                                "turn": turn,
+                                "reason": "blocked_phase2_before_user_call",
+                                "target": target_tool,
+                                "given_tool": given_tool,
+                            })
+                            drop_notes.append(
+                                f"I gave you the tool {given_tool} earlier — please call it "
+                                f"with the specific transaction details first. I will only "
+                                f"update the backend records after the customer has submitted."
+                            )
+                            blocked = True
+                            break
+                if blocked:
+                    continue
+
             kept.append(tc)
+
+        # Intervention F (Commit 1): post-give tell-the-customer reminder.
+        # If a give_discoverable_user_tool was kept in this turn, append a
+        # reminder to the assistant content telling the LLM to follow up
+        # with the specific argument values the customer needs. The customer
+        # simulator does not autonomously know transaction_ids — the agent
+        # MUST tell it explicitly. This nudges the LLM to do that on the
+        # NEXT turn (when it sees its own previous content).
+        give_notes: list[str] = []
+        for tc in kept:
+            if tc.name != "give_discoverable_user_tool":
+                continue
+            args = tc.arguments if isinstance(tc.arguments, dict) else {}
+            target = args.get("discoverable_tool_name") or args.get("tool_name")
+            if not target:
+                continue
+            uid = self._task_state.get("current_user_id") or "<user_id>"
+            txns = (self._task_state.get("transactions_by_user") or {}).get(uid) or []
+            if target == "submit_cash_back_dispute_0589" and txns:
+                # Suggest a concrete invocation script for each known txn
+                examples = [f'transaction_id="{t}"' for t in txns[:6]]
+                give_notes.append(
+                    f"Reminder: now tell the customer the EXACT calls to make. "
+                    f"For each transaction with incorrect cash back, ask the customer to call: "
+                    f'submit_cash_back_dispute_0589(user_id="{uid}", <one transaction_id>). '
+                    f"Example transaction_ids from this account: {', '.join(t for t in txns[:6])}."
+                )
+            elif target:
+                # Generic reminder when we don't have the specific arg values
+                give_notes.append(
+                    f"Reminder: tell the customer the EXACT arguments to use with {target}. "
+                    f"Pull any IDs they need from a get_* tool result and include them in your "
+                    f"next message — the customer cannot guess the right values."
+                )
 
         # If we dropped everything, we MUST return visible content so the
         # LLM sees what happened and doesn't immediately retry the same call.
@@ -713,12 +904,13 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                 tool_calls=None,
             )
 
-        if kept != assistant_msg.tool_calls:
-            # Partial drop: keep surviving calls, append drop notes to content
-            # so future turns see what happened.
+        if kept != assistant_msg.tool_calls or drop_notes or give_notes:
+            # Partial drop OR a give-tool reminder fired: keep surviving calls,
+            # append both drop notes and give notes to the content.
             content = assistant_msg.content or ""
-            if drop_notes:
-                content = (content + " " + " ".join(drop_notes)).strip()
+            extras = drop_notes + give_notes
+            if extras:
+                content = (content + " " + " ".join(extras)).strip()
             return AssistantMessage(
                 role="assistant",
                 content=content,

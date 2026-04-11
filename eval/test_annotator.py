@@ -409,6 +409,198 @@ def test_parse_catalog_missing_file():
     assert_eq(result["by_name"], {}, "by_name empty")
 
 
+# ── Commit 1 tests: user-compliance loop + give-user-tool enforcement ──────
+
+def test_track_state_detects_user_tool_execution():
+    section("test_track_state_detects_user_tool_execution — user counter increments")
+    from tau2.data_model.message import ToolMessage
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # Simulate that the agent gave a user tool earlier
+    agent._task_state["unlocked_for_user"].add("submit_cash_back_dispute_0589")
+    # Now an incoming tool message arrives — this is the result of a user-side
+    # call_discoverable_user_tool. The customer's tool CALL message is hidden,
+    # but the RESULT comes through as a regular ToolMessage with text like
+    # "Executed: submit_cash_back_dispute_0589".
+    incoming = ToolMessage(
+        role="tool",
+        id="tm1",
+        content=(
+            "Cash back dispute submitted successfully. Your case has been queued for review.\n\n"
+            "Executed: submit_cash_back_dispute_0589\n"
+            'Arguments: {"user_id": "abc123", "transaction_id": "txn_xyz"}\n'
+            "Transaction updated: ..."
+        ),
+    )
+    agent._track_state(incoming, None)
+    counts = agent._task_state.get("user_calls_by_tool", {})
+    assert_eq(counts.get("submit_cash_back_dispute_0589"), 1, "first user call counted")
+    # Same tool fires again
+    agent._track_state(incoming, None)
+    counts = agent._task_state.get("user_calls_by_tool", {})
+    assert_eq(counts.get("submit_cash_back_dispute_0589"), 2, "second user call counted")
+
+
+def test_track_state_ignores_non_unlocked_tool_in_result():
+    section("test_track_state_ignores_non_unlocked_tool_in_result")
+    from tau2.data_model.message import ToolMessage
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # No tool given to user
+    incoming = ToolMessage(
+        role="tool",
+        id="tm1",
+        content="Executed: submit_cash_back_dispute_0589\nArguments: ...",
+    )
+    agent._track_state(incoming, None)
+    counts = agent._task_state.get("user_calls_by_tool", {})
+    assert_eq(counts.get("submit_cash_back_dispute_0589"), None, "no count without unlock")
+
+
+def test_track_state_caches_transactions():
+    section("test_track_state_caches_transactions — txn_ids cached for prompt template")
+    from tau2.data_model.message import ToolMessage, AssistantMessage, ToolCall
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # Simulate the agent calling get_credit_card_transactions_by_user
+    outgoing = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="t1", name="get_credit_card_transactions_by_user", arguments={"user_id": "u_999"}),
+    ])
+    incoming = ToolMessage(role="tool", id="r1", content=(
+        "Found 3 record(s) in 'credit_card_transaction_history':\n"
+        "1. Record ID: txn_aaa111\n   transaction_id: txn_aaa111\n   amount: 100\n"
+        "2. Record ID: txn_bbb222\n   transaction_id: txn_bbb222\n   amount: 200\n"
+        "3. Record ID: txn_ccc333\n   transaction_id: txn_ccc333\n   amount: 300\n"
+    ))
+    agent._track_state(incoming, outgoing)
+    cached = agent._task_state.get("transactions_by_user", {}).get("u_999", [])
+    assert_eq(cached, ["txn_aaa111", "txn_bbb222", "txn_ccc333"], "all 3 txn_ids cached")
+    assert_eq(agent._task_state.get("current_user_id"), "u_999", "current_user_id captured")
+
+
+def test_gate_phase2_guard_blocks_premature_cleanup():
+    section("test_gate_phase2_guard_blocks_premature_cleanup — intervention E")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # Simulate task_026 partway through: agent gave the dispute tool, customer
+    # has NOT yet called it (counter = 0). Now LLM tries to call the cleanup
+    # update tool — that's premature.
+    agent._task_state["unlocked_for_user"].add("submit_cash_back_dispute_0589")
+    agent._task_state["unlocked_for_agent"].add("update_transaction_rewards_3847")
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="call_discoverable_agent_tool", arguments={
+            "agent_tool_name": "update_transaction_rewards_3847",
+            "arguments": '{"transaction_id": "txn_xyz", "new_rewards_earned": "100"}',
+        }),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(out.tool_calls, None, "premature cleanup dropped")
+    assert_contains(out.content, "submit_cash_back_dispute_0589", "drop note names the user tool")
+    interventions = agent._task_state["gate_interventions"]
+    assert_eq(len(interventions), 1, "one intervention logged")
+    assert_eq(interventions[0]["reason"], "blocked_phase2_before_user_call", "reason: phase2 block")
+
+
+def test_gate_phase2_guard_allows_after_user_call():
+    section("test_gate_phase2_guard_allows_after_user_call — intervention E unblocks")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    agent._task_state["unlocked_for_user"].add("submit_cash_back_dispute_0589")
+    agent._task_state["unlocked_for_agent"].add("update_transaction_rewards_3847")
+    # Customer has now called the tool at least once
+    agent._task_state["user_calls_by_tool"]["submit_cash_back_dispute_0589"] = 1
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="call_discoverable_agent_tool", arguments={
+            "agent_tool_name": "update_transaction_rewards_3847",
+            "arguments": '{"transaction_id": "txn_xyz", "new_rewards_earned": "100"}',
+        }),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(len(out.tool_calls or []), 1, "cleanup passes when user has called the tool")
+
+
+def test_gate_phase2_guard_no_pairing_no_block():
+    section("test_gate_phase2_guard_no_pairing — unrelated cleanup not blocked")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # Different user-side tool given (not in the pair list)
+    agent._task_state["unlocked_for_user"].add("get_referral_link")
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="call_discoverable_agent_tool", arguments={
+            "agent_tool_name": "update_transaction_rewards_3847",
+            "arguments": '{"transaction_id": "txn_xyz", "new_rewards_earned": "100"}',
+        }),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(len(out.tool_calls or []), 1, "unrelated cleanup not blocked")
+
+
+def test_gate_post_give_tells_customer_args():
+    section("test_gate_post_give_tells_customer_args — intervention F")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # Pre-populate cached transactions and user_id so the gate can render
+    # concrete examples in the reminder.
+    agent._task_state["current_user_id"] = "u_abc"
+    agent._task_state["transactions_by_user"]["u_abc"] = ["txn_a1", "txn_b2", "txn_c3"]
+    msg = AssistantMessage(role="assistant", content="Here you go.", tool_calls=[
+        ToolCall(id="1", name="give_discoverable_user_tool",
+                 arguments={"discoverable_tool_name": "submit_cash_back_dispute_0589"}),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(len(out.tool_calls or []), 1, "give kept")
+    assert_contains(out.content, "Reminder", "reminder injected")
+    assert_contains(out.content, "u_abc", "user_id in reminder")
+    assert_contains(out.content, "txn_a1", "first txn_id in reminder")
+    assert_contains(out.content, "txn_b2", "second txn_id in reminder")
+
+
+def test_gate_post_give_generic_when_no_txns_cached():
+    section("test_gate_post_give_generic — fallback reminder when no txns cached")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    msg = AssistantMessage(role="assistant", content="Here you go.", tool_calls=[
+        ToolCall(id="1", name="give_discoverable_user_tool",
+                 arguments={"discoverable_tool_name": "deposit_check_3847"}),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(len(out.tool_calls or []), 1, "give kept")
+    assert_contains(out.content, "Reminder", "generic reminder fired")
+    assert_contains(out.content, "deposit_check_3847", "tool name mentioned")
+
+
+def test_annotator_user_side_tool_required_note():
+    section("test_annotator_user_side_tool_required — strong nudge for user-side tools")
+    content = (
+        "When a customer reports a cash back discrepancy, give them "
+        "submit_cash_back_dispute_0589 to file the dispute themselves."
+    )
+    state = {"unlocked_for_agent": set(), "unlocked_for_user": set(), "verified_user_ids": set()}
+    result = annotate_banking(content, state=state)
+    assert_contains(result, "USER-SIDE TOOL REQUIRED", "user-side note fires")
+    assert_contains(result, "submit_cash_back_dispute_0589", "tool name in note")
+    assert_contains(result, "give_discoverable_user_tool", "instructs give_*")
+
+
+def test_annotator_user_side_skipped_when_already_given():
+    section("test_annotator_user_side_skipped — note suppressed once given")
+    content = "Use submit_cash_back_dispute_0589 to file the dispute."
+    state = {
+        "unlocked_for_agent": set(),
+        "unlocked_for_user": {"submit_cash_back_dispute_0589"},
+        "verified_user_ids": set(),
+    }
+    result = annotate_banking(content, state=state)
+    assert_not_contains(result, "USER-SIDE TOOL REQUIRED", "note suppressed when already given")
+
+
+def test_annotator_user_tool_status_present_after_give():
+    section("test_annotator_user_tool_status — live counter visible to LLM")
+    content = "Some KB doc text."
+    state = {
+        "unlocked_for_agent": set(),
+        "unlocked_for_user": {"submit_cash_back_dispute_0589"},
+        "user_calls_by_tool": {"submit_cash_back_dispute_0589": 2},
+        "verified_user_ids": set(),
+    }
+    result = annotate_banking(content, state=state)
+    assert_contains(result, "USER TOOL STATUS", "status block present")
+    assert_contains(result, "submit_cash_back_dispute_0589", "tool name in status")
+    assert_contains(result, "2 time", "count rendered")
+
+
 # ── runner ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -443,6 +635,18 @@ def main():
     test_gate_allows_valid_unlock()
     test_gate_encodes_dict_arguments()
     test_parse_catalog_missing_file()
+    # Commit 1: user-compliance loop tests
+    test_track_state_detects_user_tool_execution()
+    test_track_state_ignores_non_unlocked_tool_in_result()
+    test_track_state_caches_transactions()
+    test_gate_phase2_guard_blocks_premature_cleanup()
+    test_gate_phase2_guard_allows_after_user_call()
+    test_gate_phase2_guard_no_pairing_no_block()
+    test_gate_post_give_tells_customer_args()
+    test_gate_post_give_generic_when_no_txns_cached()
+    test_annotator_user_side_tool_required_note()
+    test_annotator_user_side_skipped_when_already_given()
+    test_annotator_user_tool_status_present_after_give()
 
     print(f"\n{'='*60}")
     print(f"  {PASSED} passed, {FAILED} failed")
