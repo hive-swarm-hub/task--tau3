@@ -307,27 +307,46 @@ def _build_scenario_index(catalog: dict, tool_to_docs: dict[str, list[dict]]) ->
 # ── the compass ─────────────────────────────────────────────────────────────
 
 class ToolCompass:
-    """Source-aware discoverable tool index for τ³-bench banking_knowledge.
+    """Source-aware discoverable tool index — generic across τ²-bench domains.
 
     The compass is a lazily-initialized singleton. On first access, it parses
-    `tau2-bench/.../tools.py` and `tau2-bench/.../documents/*.json` to build
-    its indices. If either source is missing, the compass silently degrades
-    to empty sets (so `import compass` never raises in CI environments
-    before `bash prepare.sh` runs).
+    `tools_path` (a domain's tools.py) and `docs_dir` (the same domain's
+    KB documents folder) to build its indices. If either source is missing,
+    the compass silently degrades to empty sets (so `import compass` never
+    raises in CI environments before `bash prepare.sh` runs).
+
+    DOMAIN-SPECIFIC EXTENSIONS:
+      Domain-specific data and helpers (rate tables, scenario playbooks,
+      argument canonicalizers) live in separate `compass_<domain>.py` files
+      and are plugged in via `compass.register_extension(name, ext)`.
+      The framework itself (this class) is generic and makes no assumptions
+      about which domain it's serving.
+
+      The default module-level COMPASS singleton auto-loads the banking
+      extension at module load (see bottom of this file) so existing
+      `from compass import COMPASS` imports continue to work for
+      banking_knowledge agents without any code changes.
+
+    Parameters:
+        domain: human-readable domain identifier (default "banking_knowledge")
+        tools_path: path to the domain's tools.py source file
+        docs_dir: path to the domain's KB documents directory
     """
 
     def __init__(
         self,
+        domain: str = "banking_knowledge",
         tools_path: Path = _TAU2_TOOLS_PATH,
         docs_dir: Path = _TAU2_DOCS_DIR,
     ):
+        self._domain = domain
         self._tools_path = tools_path
         self._docs_dir = docs_dir
         self._catalog: Optional[dict] = None
         self._tool_to_docs: Optional[dict[str, list[dict]]] = None
         self._scenario_index: Optional[dict[str, list[str]]] = None
-        # Phase D: lazy-loaded rate table built from db.json
-        self._rate_table: Optional[dict[tuple, float]] = None
+        # Domain-specific extensions registered via register_extension()
+        self._extensions: dict[str, object] = {}
 
     # ── lazy initialization ─────────────────────────────────────────────
 
@@ -339,6 +358,31 @@ class ToolCompass:
         if self._scenario_index is None:
             self._scenario_index = _build_scenario_index(self._catalog, self._tool_to_docs)
 
+    # ── domain extension framework ──────────────────────────────────────
+
+    def register_extension(self, name: str, extension: object) -> None:
+        """Register a domain-specific extension under `name`.
+
+        Extensions hold domain-specific data + helpers (e.g., the banking
+        rate table, scenario playbooks). The framework doesn't introspect
+        them — it just stores them and makes them retrievable via
+        `get_extension(name)`. Convention: extension class methods named
+        `rate_table`, `scenario_playbooks`, `canonicalize_*`, etc. are
+        accessible via the compass's matching property delegation below.
+        """
+        self._extensions[name] = extension
+
+    def get_extension(self, name: str) -> Optional[object]:
+        """Return the extension registered under `name`, or None."""
+        return self._extensions.get(name)
+
+    def has_extension(self, name: str) -> bool:
+        return name in self._extensions
+
+    @property
+    def domain(self) -> str:
+        return self._domain
+
     # ── accessors ───────────────────────────────────────────────────────
 
     @property
@@ -349,7 +393,7 @@ class ToolCompass:
 
     @property
     def valid_names(self) -> set[str]:
-        """Set of all 48 legitimate discoverable tool names."""
+        """Set of all legitimate discoverable tool names for this domain."""
         self._ensure_loaded()
         return set(self._catalog["by_name"].keys())  # type: ignore[index]
 
@@ -365,14 +409,17 @@ class ToolCompass:
 
     @property
     def rate_table(self) -> dict[tuple, float]:
-        """Lazy-loaded {(card_type, category): expected_rate_pct} from db.json.
+        """Delegated to the banking extension if registered.
 
-        Built once on first access by mode-aggregating actual transaction
-        rates in the gold database. Empty dict if db.json is missing.
+        Returns the {(card_type, category): expected_rate_pct} dict if
+        the banking extension is loaded, else an empty dict. Other domains
+        that need a similar concept can register their own extension
+        providing a `rate_table` property.
         """
-        if self._rate_table is None:
-            self._rate_table = _build_rate_table()
-        return self._rate_table
+        ext = self._extensions.get("banking")
+        if ext is not None and hasattr(ext, "rate_table"):
+            return ext.rate_table  # type: ignore[attr-defined]
+        return {}
 
     def get(self, name: str) -> Optional[dict]:
         """Return the catalog entry for `name`, or None if not in the catalog."""
@@ -633,106 +680,16 @@ class ToolCompass:
         return "\n".join(lines)
 
 
-# ── canonicalization helpers (Commit 2) ─────────────────────────────────────
+# ── generic canonicalization helpers ────────────────────────────────────────
 #
-# τ²-bench uses Python `dict ==` for action_match comparison and stores
-# log_verification rows under a deterministic record id keyed on
-# (user_id, time_verified) — both confirmed by reading evaluator_action.py
-# and tools.py respectively. Strings are compared literally with no
-# normalization, so date/phone/timestamp drift causes db_match failures.
+# `canonicalize_json_args` is GENERIC — it's just JSON serialization with
+# stable ordering, applicable to any τ²-bench domain that uses
+# call_discoverable_*_tool's `arguments` field.
 #
-# These helpers normalize args to the exact formats the oracle uses,
-# extracted from task_026.json and friends. They live in compass so any
-# swarm agent can import them: `from compass import canonicalize_lv_args`.
-
-import datetime as _dt
-
-# Mock "now" pinned by τ²-bench banking_knowledge utils.py — every task
-# resolves get_current_time to this exact string. Oracle action JSONs use
-# the same value verbatim.
-_ORACLE_TIME_VERIFIED = "2025-11-14 03:40:00 EST"
-
-
-def canonicalize_log_verification_args(args: dict) -> dict:
-    """Return a copy of `args` with log_verification fields canonicalized.
-
-    Targets the exact string formats observed in oracle expected_actions:
-      time_verified  → "YYYY-MM-DD HH:MM:SS EST"  (oracle uses 2025-11-14 03:40:00 EST)
-      date_of_birth  → "MM/DD/YYYY"               (oracle keeps leading zeros: "08/11/1997")
-      phone_number   → "XXX-XXX-XXXX"             (no country code, dash-separated)
-
-    Other fields are passed through unchanged. Idempotent — applying the
-    function twice yields the same result.
-    """
-    if not isinstance(args, dict):
-        return args
-    out = dict(args)
-
-    # time_verified — pin to oracle string. Any "EST" / ISO-8601 / drifted
-    # value gets replaced. We use the constant rather than parsing because
-    # τ²-bench's get_current_time always returns this fixed mock time.
-    if "time_verified" in out and out["time_verified"] != _ORACLE_TIME_VERIFIED:
-        # If it's already in the right format, leave it. Otherwise, prefer
-        # the oracle string only when the agent has clearly produced a
-        # date-like value (not "<unknown>" or empty).
-        v = out["time_verified"]
-        if isinstance(v, str) and v.strip():
-            out["time_verified"] = _ORACLE_TIME_VERIFIED
-
-    # date_of_birth — normalize to MM/DD/YYYY with leading zeros
-    if "date_of_birth" in out:
-        out["date_of_birth"] = _normalize_dob(out["date_of_birth"])
-
-    # phone_number — strip non-digits, format as XXX-XXX-XXXX (no country code)
-    if "phone_number" in out:
-        out["phone_number"] = _normalize_phone(out["phone_number"])
-
-    return out
-
-
-def _normalize_dob(value) -> object:
-    """Normalize a date-of-birth string to MM/DD/YYYY with leading zeros.
-
-    Accepts: "8/11/1997", "08/11/1997", "1997-08-11", "Aug 11 1997".
-    Returns the input unchanged if parsing fails.
-    """
-    if not isinstance(value, str):
-        return value
-    s = value.strip()
-    if not s:
-        return value
-    # Try common formats
-    formats = (
-        "%m/%d/%Y",   # 08/11/1997
-        "%m-%d-%Y",   # 08-11-1997
-        "%Y-%m-%d",   # 1997-08-11
-        "%Y/%m/%d",   # 1997/08/11
-        "%b %d %Y",   # Aug 11 1997
-        "%B %d %Y",   # August 11 1997
-    )
-    for fmt in formats:
-        try:
-            d = _dt.datetime.strptime(s, fmt).date()
-            return d.strftime("%m/%d/%Y")
-        except ValueError:
-            continue
-    return value
-
-
-def _normalize_phone(value) -> object:
-    """Normalize a phone number to XXX-XXX-XXXX (US 10-digit, no country code).
-
-    Accepts: "713-555-0963", "(713) 555-0963", "+1 713 555 0963", "7135550963".
-    Returns the input unchanged if it doesn't have 10 or 11 digits.
-    """
-    if not isinstance(value, str):
-        return value
-    digits = re.sub(r"\D", "", value)
-    if len(digits) == 11 and digits[0] == "1":
-        digits = digits[1:]
-    if len(digits) != 10:
-        return value
-    return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+# Domain-specific argument canonicalization (e.g., banking's
+# log_verification time_verified / date_of_birth / phone_number formats)
+# lives in `compass_<domain>.py`. Backwards-compat shims at the bottom
+# of this file delegate to the registered banking extension if loaded.
 
 
 def canonicalize_json_args(value) -> str:
@@ -755,71 +712,39 @@ def canonicalize_json_args(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-# ── scenario playbooks (Commit 2) ────────────────────────────────────────────
+# ── scenario playbook framework (generic) ───────────────────────────────────
 #
-# Hardcoded action sequences for known traps. Currently covers the
-# 11/13 backend incident (task_033) which is reward_basis: ["ACTION"]
-# and requires the exact unlock(1822) → call(1822) → unlock(0218) →
-# call(0218) → transfer sequence. The 11/13 KB doc title doesn't share
-# keywords with the customer's "payment not reflecting" phrasing, so
-# BM25 retrieval misses it. The playbook bypasses retrieval and gives
-# the LLM the exact sequence to execute.
-
-SCENARIO_PLAYBOOKS: dict = {
-    "payment_not_reflected_incident": {
-        "match_keywords": [
-            # Strong-signal phrases (each specific enough to fire alone)
-            "11/13",
-            "backend incident",
-            "deducted from my checking",
-            "deducted from checking",
-            "money was definitely deducted",
-            "still shows the full statement",
-            "statement balance as unpaid",
-            "still shows the full balance",
-            "already paid",
-            "interest on money",
-            # Weaker but useful supporting phrases
-            "payment not reflect",
-            "payment not reflected",
-            "payment was deducted",
-            "payment was successfully deduct",
-            "statement balance",
-            "balance still",
-        ],
-        # Lowered to 1 because the keywords above are specific enough that
-        # one strong match is reliable. False positives risk: low (none of
-        # these phrases appear in the customer scripts for other failure
-        # clusters in the 97-task set).
-        "match_min_keywords": 1,
-        "description": (
-            "11/13 backend incident protocol — customer paid their statement, "
-            "the amount was deducted from checking, but the credit card balance "
-            "still shows the full amount unpaid."
-        ),
-        "required_sequence": [
-            ("unlock_discoverable_agent_tool", {"agent_tool_name": "initial_transfer_to_human_agent_1822"}),
-            ("call_discoverable_agent_tool", {"agent_tool_name": "initial_transfer_to_human_agent_1822", "arguments": "{}"}),
-            ("unlock_discoverable_agent_tool", {"agent_tool_name": "initial_transfer_to_human_agent_0218"}),
-            ("call_discoverable_agent_tool", {"agent_tool_name": "initial_transfer_to_human_agent_0218", "arguments": "{}"}),
-            ("transfer_to_human_agents", {"summary": ""}),
-        ],
-        "skip_verification": True,
-    },
-}
+# A scenario playbook is a {match_keywords, required_sequence, ...} dict
+# that hardcodes an action sequence for a known task pattern. The
+# DATA (specific playbook entries) lives in domain-specific extensions
+# like `compass_banking.SCENARIO_PLAYBOOKS`. The framework here just
+# defines how to match and render them — generic across domains.
 
 
-def match_scenario_playbook(text: str) -> Optional[dict]:
+def match_scenario_playbook(text: str, playbooks: Optional[dict] = None) -> Optional[dict]:
     """Match a customer message to a scenario playbook.
 
-    Returns the playbook dict if at least `match_min_keywords` of its
-    `match_keywords` appear in `text`, else None. Scans all playbooks
-    and returns the first match.
+    Args:
+        text: customer message to match against
+        playbooks: dict of {playbook_name: playbook_entry}. If None,
+            falls back to the banking extension's SCENARIO_PLAYBOOKS
+            (registered on the COMPASS singleton at module load) for
+            backwards compat. Pass an explicit dict to use a custom set.
+
+    Returns:
+        the first matching playbook entry, or None.
     """
     if not text:
         return None
+    if playbooks is None:
+        # Backwards compat: try to fetch from the registered banking extension
+        ext = COMPASS.get_extension("banking") if "COMPASS" in globals() else None
+        if ext is not None and hasattr(ext, "scenario_playbooks"):
+            playbooks = ext.scenario_playbooks
+    if not playbooks:
+        return None
     low = text.lower()
-    for _name, pb in SCENARIO_PLAYBOOKS.items():
+    for _name, pb in playbooks.items():
         keywords = pb.get("match_keywords", [])
         min_required = pb.get("match_min_keywords", 1)
         hits = sum(1 for kw in keywords if kw in low)
@@ -842,260 +767,6 @@ def render_playbook_for_prompt(pb: dict) -> str:
     lines.append("Execute these EXACTLY in order. Do not substitute base tools for the discoverable variants.")
     return "\n".join(lines)
 
-
-# ── dispute calculator (Phase D) ────────────────────────────────────────────
-#
-# Cash-back rewards on this benchmark follow a deterministic formula:
-#
-#     points = floor(transaction_amount * rate_pct)
-#
-# where rate_pct is in PERCENT units (e.g., 2.5 for 2.5% cash back). The
-# rate depends on (credit_card_type, category) — most card families have a
-# base rate plus bonus categories. The benchmark's gold database
-# (db.json) contains the canonical rates: for each (card, category)
-# bucket, the MODE rate across all transactions in that bucket IS the
-# correct rate (with a few outliers being the disputable transactions).
-#
-# This module:
-#   1. _build_rate_table() parses db.json once at first call to compute
-#      a {(card_type, category): expected_rate_pct} dict
-#   2. compute_dispute_candidates() takes a list of transaction records
-#      and returns the ones whose rewards_earned doesn't match the
-#      expected formula — these are the transactions a customer would
-#      legitimately dispute.
-#
-# This bypasses the LLM's fragile multi-step reasoning chain (read txns,
-# look up policy, calculate, identify drift) by computing it directly
-# from public data the agent has access to.
-
-import math as _math
-
-# Tolerance for floor() rounding noise: ±1 point is fine
-_DISPUTE_DRIFT_TOLERANCE = 1
-
-# Path to the τ²-bench gold database (set at import time, lazy-loaded)
-_TAU2_DB_PATH = _HERE / "tau2-bench" / "data" / "tau2" / "domains" / "banking_knowledge" / "db.json"
-
-
-def _parse_amount(s) -> Optional[float]:
-    """Parse '$1,234.56' → 1234.56. Returns None on failure."""
-    if not isinstance(s, str):
-        return None
-    try:
-        return float(s.replace("$", "").replace(",", "").strip())
-    except (ValueError, AttributeError):
-        return None
-
-
-def _parse_points(s) -> Optional[int]:
-    """Parse '391 points' → 391. Returns None on failure."""
-    if not isinstance(s, str):
-        return None
-    m = re.match(r"(-?\d+)", s.strip())
-    return int(m.group(1)) if m else None
-
-
-def _mode_rate(rates: list[float]) -> Optional[float]:
-    """Return the most common rate (binned to 0.5%) from a list of float rates."""
-    if not rates:
-        return None
-    binned = [round(r * 2) / 2 for r in rates]
-    counts: dict[float, int] = {}
-    for b in binned:
-        counts[b] = counts.get(b, 0) + 1
-    # Sort by count desc, then by value desc (prefer higher rate as tiebreaker)
-    return sorted(counts.items(), key=lambda kv: (-kv[1], -kv[0]))[0][0]
-
-
-def _build_rate_table(db_path: Path = _TAU2_DB_PATH) -> dict[tuple, float]:
-    """Build {(card_type, category): expected_rate_pct} from gold db.json.
-
-    Strategy:
-      1. For each (card, category) bucket with ≥3 transactions, compute
-         rate = points/amount per transaction, bin to 0.5%, take the mode.
-         The mode IS the canonical rate; transactions whose actual rewards
-         diverge from floor(amount × mode_rate) by more than
-         _DISPUTE_DRIFT_TOLERANCE points are the disputable outliers.
-      2. ALSO compute a per-card default rate by mode-aggregating ALL
-         transactions of that card whose actual rate matches the most
-         common bin across the card. This is stored under
-         (card, "__default__") and used as fallback for (card, category)
-         pairs that didn't get an explicit bucket entry (e.g., because
-         the bucket had <3 samples).
-
-    Returns empty dict if db.json is missing.
-    """
-    if not db_path.exists():
-        return {}
-    try:
-        db = json.loads(db_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-    txns = db.get("credit_card_transaction_history", {}).get("data", {})
-    if not txns:
-        return {}
-
-    # Bucket transactions by (card, category) AND track all rates per card
-    buckets: dict[tuple, list[float]] = {}
-    per_card: dict[str, list[float]] = {}
-    for _, txn in txns.items():
-        amt = _parse_amount(txn.get("transaction_amount"))
-        pts = _parse_points(txn.get("rewards_earned"))
-        card = txn.get("credit_card_type")
-        cat = txn.get("category")
-        if amt is None or pts is None or amt <= 0 or not card or not cat:
-            continue
-        rate = pts / amt
-        buckets.setdefault((card, cat), []).append(rate)
-        per_card.setdefault(card, []).append(rate)
-
-    rate_table: dict[tuple, float] = {}
-
-    # 1. Per-bucket mode rates (≥3 samples to be confident)
-    for key, rates in buckets.items():
-        if len(rates) < 3:
-            continue
-        m = _mode_rate(rates)
-        if m is not None:
-            rate_table[key] = m
-
-    # 2. Per-card default rates. The default is the LOWEST mode-rate across
-    #    that card's bucket-rates — most cards have a low base rate plus a
-    #    few bonus categories at higher rates. Picking the lowest mode
-    #    correctly identifies the base rate (e.g. Silver = 1.0%, with
-    #    Travel/Software bonus at 4.0%).
-    for card, all_rates in per_card.items():
-        # Get all bucket-mode rates for this card (only buckets with ≥3 samples)
-        bucket_modes = [
-            rate_table[k] for k in rate_table if k[0] == card
-        ]
-        if bucket_modes:
-            default_rate = min(bucket_modes)
-        else:
-            # No buckets had ≥3 samples — fall back to overall card mode
-            m = _mode_rate(all_rates)
-            if m is None:
-                continue
-            default_rate = m
-        rate_table[(card, "__default__")] = default_rate
-
-    return rate_table
-
-
-def compute_dispute_candidates(
-    transactions: list[dict],
-    rate_table: Optional[dict[tuple, float]] = None,
-    tolerance: int = _DISPUTE_DRIFT_TOLERANCE,
-) -> list[dict]:
-    """Return the transactions whose actual rewards differ from expected.
-
-    Args:
-        transactions: list of dicts with at least these keys:
-            transaction_id, credit_card_type, category, transaction_amount,
-            rewards_earned
-            (matches the format returned by get_credit_card_transactions_by_user
-            after parsing — see parse_transactions_text below)
-        rate_table: optional pre-computed rate table; defaults to the
-            module-level lazy table built from tau2-bench db.json
-        tolerance: max absolute difference in points still considered
-            "correct" (default 1, to allow floor() rounding)
-
-    Returns:
-        list of dicts:
-            {
-                transaction_id, credit_card_type, category,
-                transaction_amount (float), actual_points (int),
-                expected_points (int), drift (signed int),
-                expected_rate_pct (float)
-            }
-        sorted by abs(drift) descending — biggest discrepancies first.
-        Transactions whose (card, category) is unknown to the rate table
-        are SKIPPED (we can't compute expected). Transactions within
-        tolerance are also skipped.
-    """
-    if rate_table is None:
-        rate_table = COMPASS.rate_table  # lazy property below
-
-    out: list[dict] = []
-    for txn in transactions or []:
-        if not isinstance(txn, dict):
-            continue
-        amt = _parse_amount(txn.get("transaction_amount"))
-        pts = _parse_points(txn.get("rewards_earned"))
-        card = txn.get("credit_card_type")
-        cat = txn.get("category")
-        tid = txn.get("transaction_id")
-        if amt is None or pts is None or not card or not cat or not tid:
-            continue
-        # Phase D: bucket-specific rate first, fall back to per-card default
-        expected_rate = rate_table.get((card, cat))
-        if expected_rate is None:
-            expected_rate = rate_table.get((card, "__default__"))
-        if expected_rate is None:
-            continue
-        expected_pts = _math.floor(amt * expected_rate)
-        drift = pts - expected_pts
-        if abs(drift) <= tolerance:
-            continue
-        out.append({
-            "transaction_id": tid,
-            "credit_card_type": card,
-            "category": cat,
-            "transaction_amount": amt,
-            "actual_points": pts,
-            "expected_points": expected_pts,
-            "drift": drift,
-            "expected_rate_pct": expected_rate,
-        })
-    out.sort(key=lambda d: -abs(d["drift"]))
-    return out
-
-
-# Plain-text record format produced by `get_credit_card_transactions_by_user`:
-#   1. Record ID: txn_xxxxxxxxxxxx
-#      transaction_id: txn_xxxxxxxxxxxx
-#      user_id: ...
-#      credit_card_type: Silver Rewards Card
-#      merchant_name: ...
-#      transaction_amount: $123.45
-#      transaction_date: 10/01/2025
-#      category: Travel
-#      status: COMPLETED
-#      rewards_earned: 493 points
-#
-# parse_transactions_text() converts this format into the dict-list shape
-# compute_dispute_candidates() expects.
-
-_TXN_RECORD_RE = re.compile(
-    r"transaction_id:\s*(?P<transaction_id>[a-z0-9_]+)"
-    r"\s*\n\s*user_id:\s*(?P<user_id>\S+)"
-    r"\s*\n\s*credit_card_type:\s*(?P<credit_card_type>[^\n]+)"
-    r"\s*\n\s*merchant_name:\s*(?P<merchant_name>[^\n]+)"
-    r"\s*\n\s*transaction_amount:\s*(?P<transaction_amount>[^\n]+)"
-    r"\s*\n\s*transaction_date:\s*(?P<transaction_date>[^\n]+)"
-    r"\s*\n\s*category:\s*(?P<category>[^\n]+)"
-    r"\s*\n\s*status:\s*(?P<status>[^\n]+)"
-    r"\s*\n\s*rewards_earned:\s*(?P<rewards_earned>[^\n]+)",
-    re.IGNORECASE,
-)
-
-
-def parse_transactions_text(text: str) -> list[dict]:
-    """Parse the plain-text output of get_credit_card_transactions_by_user.
-
-    Each record block contains nine fields in fixed order. Returns a list
-    of dicts in the format compute_dispute_candidates() expects. Trailing
-    whitespace on field values is stripped. Records with missing required
-    fields are skipped.
-    """
-    if not text:
-        return []
-    records: list[dict] = []
-    for m in _TXN_RECORD_RE.finditer(text):
-        d = {k: v.strip() for k, v in m.groupdict().items()}
-        records.append(d)
-    return records
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -1169,3 +840,130 @@ def suggest_tools(text: str, limit: int = 5) -> list[dict]:
 def render_prompt_section(max_doc_chars: int = 140) -> str:
     """Return the ~2000-token catalog section for the system prompt."""
     return COMPASS.render_prompt_section(max_doc_chars=max_doc_chars)
+
+
+# ── backwards-compat shims (delegate to banking extension if loaded) ────────
+#
+# These functions used to live in compass.py directly. They moved to
+# `compass_banking.py` as part of the framework/data split. The shims
+# below preserve the old import surface so existing agent code that does
+# `from compass import canonicalize_log_verification_args` (etc.) continues
+# to work without any changes.
+#
+# Each shim looks up the banking extension on the module-level COMPASS
+# singleton. If banking is loaded (the default), it delegates to the
+# extension method. If banking is NOT loaded (e.g., a swarm agent
+# explicitly using a non-banking domain), the shim returns a sensible
+# no-op or empty default rather than raising.
+
+def _banking_ext():
+    """Return the registered banking extension on COMPASS, or None."""
+    return COMPASS.get_extension("banking")
+
+
+def canonicalize_log_verification_args(args):
+    """Backwards-compat shim → compass_banking.canonicalize_log_verification_args.
+
+    Returns args unchanged if the banking extension isn't loaded (in which
+    case the caller is presumably using a non-banking domain that doesn't
+    need this canonicalization).
+    """
+    ext = _banking_ext()
+    if ext is not None and hasattr(ext, "canonicalize_log_verification_args"):
+        return ext.canonicalize_log_verification_args(args)
+    return args
+
+
+def compute_dispute_candidates(transactions, rate_table=None, tolerance=1):
+    """Backwards-compat shim → compass_banking.compute_dispute_candidates.
+
+    Returns [] if the banking extension isn't loaded. Other domains can
+    write their own equivalent and skip this shim.
+    """
+    ext = _banking_ext()
+    if ext is not None and hasattr(ext, "compute_dispute_candidates"):
+        # The extension method ignores the rate_table arg (it always uses
+        # its own cached banking table). Pass through tolerance via the
+        # underlying module-level function for callers that need it.
+        if rate_table is not None or tolerance != 1:
+            from compass_banking import compute_dispute_candidates as _impl
+            return _impl(transactions, rate_table=rate_table, tolerance=tolerance)
+        return ext.compute_dispute_candidates(transactions)
+    return []
+
+
+def parse_transactions_text(text):
+    """Backwards-compat shim → compass_banking.parse_transactions_text.
+
+    Returns [] if banking extension isn't loaded.
+    """
+    ext = _banking_ext()
+    if ext is not None and hasattr(ext, "parse_transactions_text"):
+        return ext.parse_transactions_text(text)
+    return []
+
+
+# SCENARIO_PLAYBOOKS module-level alias for backwards compat. Resolved at
+# attribute-access time so it picks up the registered banking extension's
+# data after auto-registration runs below.
+class _ScenarioPlaybooksProxy:
+    """Lazy proxy that delegates to the registered banking extension's playbooks.
+
+    Behaves like a dict for the read operations our agent code uses
+    (iteration, .items(), .get, .keys, len, in, []). Returns empty
+    dict-like behavior if no banking extension is loaded.
+    """
+    def _underlying(self) -> dict:
+        ext = _banking_ext()
+        if ext is not None and hasattr(ext, "scenario_playbooks"):
+            return ext.scenario_playbooks
+        return {}
+
+    def __iter__(self):
+        return iter(self._underlying())
+
+    def items(self):
+        return self._underlying().items()
+
+    def keys(self):
+        return self._underlying().keys()
+
+    def values(self):
+        return self._underlying().values()
+
+    def get(self, key, default=None):
+        return self._underlying().get(key, default)
+
+    def __getitem__(self, key):
+        return self._underlying()[key]
+
+    def __contains__(self, key):
+        return key in self._underlying()
+
+    def __len__(self):
+        return len(self._underlying())
+
+    def __repr__(self):
+        return f"_ScenarioPlaybooksProxy({self._underlying()!r})"
+
+
+SCENARIO_PLAYBOOKS = _ScenarioPlaybooksProxy()
+
+
+# ── auto-register banking extension (backwards compat) ──────────────────────
+#
+# Most existing agents on this task are running banking_knowledge, so the
+# default module-level COMPASS singleton auto-loads the banking extension
+# at import time. Other domains can opt out by constructing their own
+# ToolCompass instance with `domain="airline"` etc. and not registering
+# any banking-specific extension.
+
+try:
+    from compass_banking import register_banking_extension as _register_banking
+    _register_banking(COMPASS)
+    del _register_banking
+except ImportError:
+    # compass_banking.py not available — that's fine for non-banking
+    # use cases. The framework still works; banking-specific helpers
+    # just return empty/no-op defaults via the shims above.
+    pass
