@@ -24,6 +24,12 @@ NUM_TRIALS = 1
 SAMPLE_FRAC = float(os.environ.get("SAMPLE_FRAC", "1.0"))  # e.g. 0.1 for 10%
 MODEL = os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
 USER_MODEL = os.environ.get("USER_MODEL", "gpt-4.1-2025-04-14")
+# τ²-bench's stock max_concurrency is 3 (set in config.py). The eval is
+# API-bound (not CPU-bound) so we can run many simulations in parallel
+# without contention. Bumping to 12 cuts a full 97-task eval from ~60min
+# to ~15-18min on the OpenAI tier most agents are using. Override via
+# the EVAL_CONCURRENCY env var if you hit rate limits.
+MAX_CONCURRENCY = int(os.environ.get("EVAL_CONCURRENCY", "12"))
 
 
 def run_all():
@@ -50,6 +56,7 @@ def run_all():
         seed=300,
         save_to=f"eval_{DOMAIN}",
         log_level="WARNING",
+        max_concurrency=MAX_CONCURRENCY,
     )
     results = run_domain(config)
     metrics = compute_metrics(results)
