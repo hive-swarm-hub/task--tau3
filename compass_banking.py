@@ -501,18 +501,51 @@ class BankingExtension:
         """Name of the _task_state field this extension uses for transaction records."""
         return "transaction_records_by_user"
 
+    def user_id_source_tools(self) -> set:
+        """Banking tool names whose `user_id` arg identifies the active user.
+
+        agent.py's `_track_state` calls `hook_on_tool_call` for every outgoing
+        tool call; when the tool name is in this set, banking updates
+        `state["current_user_id"]` from the call's `user_id` arg. That way
+        the annotator / gate always know which user we're working with.
+
+        Other domains register their own extension with different tool
+        names (e.g., retail might use `get_customer_by_id`).
+        """
+        return {"get_user_information_by_id", "get_credit_card_transactions_by_user"}
+
+    def hook_on_tool_call(self, tool_name: str, args: dict, state: dict) -> None:
+        """Called by agent.py's `_track_state` for each outgoing tool call.
+
+        Banking-specific: if the call targets a `user_id_source_tools` entry,
+        pull `user_id` from the args and stash it in `state["current_user_id"]`.
+        No-op otherwise. Extensions for other domains plug in their own
+        identity-tracking logic here.
+        """
+        if tool_name in self.user_id_source_tools():
+            uid = (args or {}).get("user_id")
+            if uid:
+                state["current_user_id"] = uid
+
     def hook_on_tool_result(self, tool_name: str, content: str, current_user_id, state: dict) -> None:
         """Called by agent.py's _track_state when a tool result lands.
 
         Banking-specific behavior: when get_credit_card_transactions_by_user
-        returns, parse the records and run the dispute calculator,
-        caching both into the agent's state under the field names
-        from state_field_*().
+        returns, (1) populate a simple id-only cache via a broad regex so
+        the gate's post-give fallback can suggest txn_ids even when the
+        full structured parser fails, and (2) parse the structured records
+        and run the offline dispute calculator for Phase D's targeted
+        DISPUTE TARGETS IDENTIFIED block.
         """
         if tool_name != "get_credit_card_transactions_by_user":
             return
         if not current_user_id or not content:
             return
+        # (1) broad id-only cache — tolerates non-canonical output formats
+        txn_ids = re.findall(r"\btransaction_id:\s*([a-z0-9_]{8,})", content)
+        if txn_ids:
+            state.setdefault("transactions_by_user", {})[current_user_id] = txn_ids
+        # (2) structured parse + dispute calculator
         records = self.parse_transactions_text(content)
         if not records:
             return
@@ -586,6 +619,34 @@ class BankingExtension:
                 f"rewards directly — the customer must submit the disputes themselves via the user tool."
             )
         return None
+
+    def format_give_fallback_message(
+        self, target: str, state: dict, user_id: str
+    ) -> Optional[str]:
+        """Banking-specific fallback for agent.py's Intervention F post-give reminder.
+
+        `format_dispute_targets_message` is the primary path — it fires when
+        the Phase D dispute calculator has already run and cached structured
+        candidates. This method is the *fallback*: the calculator hasn't run
+        yet (e.g., the agent gave the dispute tool before calling
+        get_credit_card_transactions_by_user), but we still have the broad
+        id-only cache from hook_on_tool_result's regex pass.
+
+        Returns None if the target isn't one we know how to handle or we
+        have no cached ids — agent.py then falls through to its generic
+        reminder.
+        """
+        if target != "submit_cash_back_dispute_0589":
+            return None
+        txns_fallback = (state.get("transactions_by_user", {}) or {}).get(user_id, []) or []
+        if not txns_fallback:
+            return None
+        return (
+            f"Reminder: now tell the customer the EXACT calls to make. "
+            f"For each transaction with incorrect cash back, ask the customer to call: "
+            f'submit_cash_back_dispute_0589(user_id="{user_id}", transaction_id="<one transaction_id>"). '
+            f"Example transaction_ids from this account: {', '.join(t for t in txns_fallback[:6])}."
+        )
 
 
 def register_banking_extension(compass) -> "BankingExtension":

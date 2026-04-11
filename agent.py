@@ -597,19 +597,18 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             # Commit 1 additions: user-side compliance tracking
             "user_calls_by_tool": {},       # {discoverable_tool_name: count} — populated when
                                             # we observe a tool result for a user-side execution
-            "transactions_by_user": {},     # {user_id: [txn_id_list]} — list of just the IDs
-                                            # (preserved for backward-compat with Commit 1)
-            "current_user_id": None,        # most recent verified user_id (for prompt templating)
-            # Commit 2 additions
+            "current_user_id": None,        # most recent verified user_id — populated by the
+                                            # registered extension's hook_on_tool_call
             "scenario_playbook": None,      # matched compass.SCENARIO_PLAYBOOKS entry for the
                                             # customer's first message (used by annotator)
-            # Phase D additions
-            # Phase D fields: populated by the banking extension's
-            # hook_on_tool_result when get_credit_card_transactions_by_user
-            # lands. Kept declared here so annotate_banking / gate code can
-            # read them uniformly via the extension's state_field_* helpers.
-            "transaction_records_by_user": {},  # {user_id: [parsed_txn_dict]}
-            "dispute_candidates_by_user": {},   # {user_id: [dispute_dict]}
+            # Extension scratch space — pre-declared as empty dicts so test
+            # fixtures can index directly without setdefault. Ownership lives
+            # on the registered extension (banking writes to all three via
+            # hook_on_tool_result). Other extensions may ignore these keys
+            # and use their own — the framework doesn't read them.
+            "transactions_by_user": {},
+            "transaction_records_by_user": {},
+            "dispute_candidates_by_user": {},
         }
         self._consecutive_tool_calls = 0
 
@@ -667,14 +666,13 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                         self._task_state["unlocked_for_user"].add(target)
                 elif tc.name in ("KB_search", "kb_search", "search_knowledge_base"):
                     self._task_state["kb_search_count"] += 1
-                elif tc.name == "get_user_information_by_id":
-                    uid = args.get("user_id")
-                    if uid:
-                        self._task_state["current_user_id"] = uid
-                elif tc.name == "get_credit_card_transactions_by_user":
-                    uid = args.get("user_id")
-                    if uid:
-                        self._task_state["current_user_id"] = uid
+                # Domain-specific identity tracking: the extension decides
+                # which tool names reveal a user_id. Banking uses both
+                # get_user_information_by_id and get_credit_card_transactions_by_user;
+                # other domains plug in their own list. No-op when no
+                # extension is registered.
+                if _BANKING_EXT is not None:
+                    _BANKING_EXT.hook_on_tool_call(tc.name, args, self._task_state)
 
         # Parse incoming tool results and accumulate KB mentions
         tool_messages = []
@@ -710,21 +708,12 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                     counts = self._task_state.setdefault("user_calls_by_tool", {})
                     counts[tool_name] = counts.get(tool_name, 0) + 1
 
-            # COMMIT 1: cache transaction lookups so the gate can suggest exact
-            # transaction_id values when prompting the customer. This
-            # lightweight id-only cache is domain-agnostic (generic regex)
-            # so it stays inline here.
-            if last_call_name == "get_credit_card_transactions_by_user":
-                txn_ids = re.findall(r"\btransaction_id:\s*([a-z0-9_]{8,})", content)
-                uid = self._task_state.get("current_user_id")
-                if uid and txn_ids:
-                    self._task_state.setdefault("transactions_by_user", {})[uid] = txn_ids
-
-            # PHASE D: domain-specific tool-result hook. Banking's extension
-            # uses this to parse the transaction record text and run the
-            # offline dispute calculator, caching candidates into state
-            # under its own field names. Other domains plug in different
-            # behavior under the same hook. No-op if no extension.
+            # Domain-specific tool-result hook. Banking's extension uses
+            # this to parse transaction records, run the offline dispute
+            # calculator, and populate both the structured candidate cache
+            # and a broad id-only cache for the gate's post-give fallback.
+            # Other domains plug in different behavior. No-op when no
+            # extension is registered.
             if _BANKING_EXT is not None and last_call_name:
                 _BANKING_EXT.hook_on_tool_result(
                     last_call_name,
@@ -991,30 +980,25 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
 
             if domain_note:
                 give_notes.append(domain_note)
-            elif target == "submit_cash_back_dispute_0589":
-                # Fallback to Commit 1 behavior when calculator hasn't run
-                # (e.g., agent hasn't called get_credit_card_transactions_by_user yet)
-                txns_fallback = (self._task_state.get("transactions_by_user") or {}).get(uid) or []
-                if txns_fallback:
-                    give_notes.append(
-                        f"Reminder: now tell the customer the EXACT calls to make. "
-                        f"For each transaction with incorrect cash back, ask the customer to call: "
-                        f'submit_cash_back_dispute_0589(user_id="{uid}", transaction_id="<one transaction_id>"). '
-                        f"Example transaction_ids from this account: {', '.join(t for t in txns_fallback[:6])}."
+            else:
+                # Ask the extension for a domain-specific fallback (banking
+                # returns a cash-back-dispute-specific hint when the id-only
+                # txn cache is populated but the structured calculator
+                # hasn't run yet). Fall through to a generic reminder when
+                # the extension returns None or isn't registered.
+                fallback = None
+                if _BANKING_EXT is not None:
+                    fallback = _BANKING_EXT.format_give_fallback_message(
+                        target, self._task_state, uid
                     )
-                else:
+                if fallback:
+                    give_notes.append(fallback)
+                elif target:
                     give_notes.append(
                         f"Reminder: tell the customer the EXACT arguments to use with {target}. "
                         f"Pull any IDs they need from a get_* tool result and include them in your "
                         f"next message — the customer cannot guess the right values."
                     )
-            elif target:
-                # Generic reminder when we don't have specific arg values
-                give_notes.append(
-                    f"Reminder: tell the customer the EXACT arguments to use with {target}. "
-                    f"Pull any IDs they need from a get_* tool result and include them in your "
-                    f"next message — the customer cannot guess the right values."
-                )
 
         # If we dropped everything, we MUST return visible content so the
         # LLM sees what happened and doesn't immediately retry the same call.
