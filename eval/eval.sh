@@ -30,21 +30,10 @@ fi
 
 # τ²-bench v1.0.0 refuses to overwrite existing results.json and prompts
 # interactively to resume. Since every experiment is a fresh run (agent.py
-# changes between runs), we always archive-then-delete the previous results
-# first. Archiving preserves the raw per-task JSON for later auditing (the
-# rerun protocol needs this for reproducibility claims).
+# changes between runs), we always delete the previous results first.
 STALE_RESULTS="tau2-bench/data/simulations/eval_banking_knowledge"
 if [ -d "$STALE_RESULTS" ]; then
-    ARCHIVE_ROOT="eval_runs/archive"
-    ARCHIVE_TS="$(date +%Y%m%d%H%M%S)"
-    ARCHIVE_DEST="${ARCHIVE_ROOT}/eval_banking_knowledge_${ARCHIVE_TS}"
-    mkdir -p "${ARCHIVE_ROOT}"
-    # `mv` is atomic on the same filesystem and avoids a copy. If it fails
-    # (e.g. cross-device), fall back to rm so the eval can still proceed.
-    if ! mv "$STALE_RESULTS" "${ARCHIVE_DEST}" 2>/dev/null; then
-        echo "WARNING: could not archive $STALE_RESULTS to ${ARCHIVE_DEST}; deleting instead" >&2
-        rm -rf "$STALE_RESULTS"
-    fi
+    rm -rf "$STALE_RESULTS"
 fi
 
 python eval/run_eval.py
