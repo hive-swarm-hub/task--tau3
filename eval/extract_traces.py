@@ -133,9 +133,15 @@ def extract_conversation(messages: list[dict]) -> list[dict]:
 
 
 def extract_action_checks(reward_info: dict) -> list[dict]:
-    """Extract action correctness details from reward_info."""
+    """Extract action correctness details from reward_info.
+
+    `reward_info.get("action_checks")` can return None in v1.0.0 when the
+    task's `reward_basis` doesn't include "ACTION" (e.g., pure DB-match
+    tasks). Coerce None → [] so downstream iteration is safe.
+    """
     checks = []
-    for check in reward_info.get("action_checks", []):
+    raw_checks = reward_info.get("action_checks") or []
+    for check in raw_checks:
         action = check.get("expected_action", {}) or check.get("action", {})
         checks.append({
             "expected_tool": action.get("name", ""),
@@ -235,7 +241,20 @@ def analyze_discoverable_tools(messages: list[dict]) -> dict:
                     except json.JSONDecodeError:
                         args = {}
 
-                target = args.get("tool_name", "") if isinstance(args, dict) else ""
+                # τ²-bench v1.0.0 uses distinct parameter names per meta-tool:
+                #   unlock_discoverable_agent_tool → agent_tool_name
+                #   give_discoverable_user_tool    → discoverable_tool_name
+                #   call_discoverable_agent_tool   → agent_tool_name
+                # Older code used "tool_name"; we accept all three for safety.
+                if isinstance(args, dict):
+                    target = (
+                        args.get("agent_tool_name")
+                        or args.get("discoverable_tool_name")
+                        or args.get("tool_name")
+                        or ""
+                    )
+                else:
+                    target = ""
 
                 if name in _UNLOCK_TOOLS and target:
                     unlocked_for_agent.add(target)

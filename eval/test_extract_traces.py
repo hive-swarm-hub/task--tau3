@@ -97,7 +97,7 @@ def test_happy_path():
         )},
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "unlock_discoverable_agent_tool",
-             "arguments": {"tool_name": "submit_cash_back_dispute_0589"}}
+             "arguments": {"agent_tool_name": "submit_cash_back_dispute_0589"}}
         ]},
         {"role": "tool", "content": "Tool unlocked"},
         {"role": "assistant", "content": "", "tool_calls": [
@@ -176,7 +176,7 @@ def test_wasted_unlock():
         {"role": "tool", "content": "Use apply_loan_9999 to submit a loan application."},
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "unlock_discoverable_agent_tool",
-             "arguments": {"tool_name": "apply_loan_9999"}}
+             "arguments": {"agent_tool_name": "apply_loan_9999"}}
         ]},
         {"role": "tool", "content": "Tool unlocked"},
         # Agent gets stuck and never actually calls the tool
@@ -199,7 +199,7 @@ def test_unlocked_without_mention():
         # Agent unlocks a tool without searching KB first — probably hallucinated
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "unlock_discoverable_agent_tool",
-             "arguments": {"tool_name": "make_up_tool_5555"}}
+             "arguments": {"agent_tool_name": "make_up_tool_5555"}}
         ]},
         {"role": "tool", "content": "Error: tool not found in registry"},
     ]
@@ -225,7 +225,7 @@ def test_give_to_user():
         )},
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "give_discoverable_user_tool",
-             "arguments": {"tool_name": "customer_file_dispute_7777"}}
+             "arguments": {"discoverable_tool_name": "customer_file_dispute_7777"}}
         ]},
         {"role": "tool", "content": "Tool given to user"},
     ]
@@ -252,7 +252,7 @@ def test_multiple_tools():
         )},
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "unlock_discoverable_agent_tool",
-             "arguments": {"tool_name": "submit_a_1111"}}
+             "arguments": {"agent_tool_name": "submit_a_1111"}}
         ]},
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "submit_a_1111", "arguments": {}}
@@ -260,7 +260,7 @@ def test_multiple_tools():
         # tool B mentioned but forgotten — should show in missing_unlocks
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "give_discoverable_user_tool",
-             "arguments": {"tool_name": "customer_c_3333"}}
+             "arguments": {"discoverable_tool_name": "customer_c_3333"}}
         ]},
     ]
 
@@ -274,6 +274,58 @@ def test_multiple_tools():
     assert_eq(dta["unlocked_for_user"], ["customer_c_3333"], "C given to user")
     assert_eq(dta["actually_called"], ["submit_a_1111"], "A called")
     assert_eq(dta["missing_unlocks"], ["update_b_2222"], "B is the missing unlock")
+
+
+# ── test 7b: v1.0.0 argument name variants (regression guard) ───────────────
+
+def test_v1_param_names():
+    """τ²-bench v1.0.0 renamed the meta-tool parameters. Ensure the extractor
+    recognizes all three variants (legacy + the two real v1.0.0 names).
+    This is a regression guard: a previous bug hard-coded only 'tool_name',
+    making every task report inflated missing_unlocks on real eval runs.
+    """
+    section("test_v1_param_names — agent_tool_name / discoverable_tool_name / tool_name")
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"name": "KB_search", "arguments": {"query": "all"}}
+        ]},
+        {"role": "tool", "content": (
+            "Use agent_side_0001 for agent action. "
+            "Use legacy_style_0002 for legacy compat. "
+            "Have the customer use user_side_0003."
+        )},
+        # v1.0.0 real parameter name for unlock_discoverable_agent_tool
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"name": "unlock_discoverable_agent_tool",
+             "arguments": {"agent_tool_name": "agent_side_0001"}}
+        ]},
+        # legacy param name (pre-v1.0.0) should still be recognized
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"name": "unlock_discoverable_agent_tool",
+             "arguments": {"tool_name": "legacy_style_0002"}}
+        ]},
+        # v1.0.0 real parameter name for give_discoverable_user_tool
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"name": "give_discoverable_user_tool",
+             "arguments": {"discoverable_tool_name": "user_side_0003"}}
+        ]},
+    ]
+    dta = analyze_discoverable_tools(messages)
+    assert_eq(
+        sorted(dta["unlocked_for_agent"]),
+        ["agent_side_0001", "legacy_style_0002"],
+        "both v1.0.0 and legacy agent unlock names detected",
+    )
+    assert_eq(
+        dta["unlocked_for_user"],
+        ["user_side_0003"],
+        "v1.0.0 user give name detected",
+    )
+    assert_eq(
+        dta["missing_unlocks"],
+        [],
+        "no missing unlocks when all three variants are recognized",
+    )
 
 
 # ── test 8: empty / edge cases ───────────────────────────────────────────────
@@ -476,7 +528,7 @@ def test_analyze_verification_clean():
         ]},
         {"role": "tool", "content": "verified"},
         {"role": "assistant", "content": "", "tool_calls": [
-            {"name": "unlock_discoverable_agent_tool", "arguments": {"tool_name": "submit_dispute_1234"}}
+            {"name": "unlock_discoverable_agent_tool", "arguments": {"agent_tool_name": "submit_dispute_1234"}}
         ]},
         {"role": "assistant", "content": "", "tool_calls": [
             {"name": "submit_dispute_1234", "arguments": {}}
@@ -748,6 +800,7 @@ def main():
     test_unlocked_without_mention()
     test_give_to_user()
     test_multiple_tools()
+    test_v1_param_names()
     test_empty_messages()
     test_regex_patterns()
     test_ground_truth()
