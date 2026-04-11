@@ -787,6 +787,61 @@ def test_gate_post_give_uses_dispute_calculator():
     assert_contains(out.content, "6680a37184", "user_id in invocation template")
 
 
+def test_annotator_dispute_calculator_call_to_action():
+    section("test_annotator_dispute_calculator_call_to_action — Phase D nudge")
+    state = {
+        "unlocked_for_agent": set(),
+        "unlocked_for_user": set(),  # NOT yet given
+        "verified_user_ids": set(),
+        "dispute_candidates_by_user": {
+            "u_xyz": [
+                {
+                    "transaction_id": "txn_1",
+                    "credit_card_type": "Silver Rewards Card",
+                    "category": "Travel",
+                    "transaction_amount": 100.0,
+                    "actual_points": 100,
+                    "expected_points": 400,
+                    "drift": -300,
+                    "expected_rate_pct": 4.0,
+                },
+                {
+                    "transaction_id": "txn_2",
+                    "credit_card_type": "Silver Rewards Card",
+                    "category": "Travel",
+                    "transaction_amount": 50.0,
+                    "actual_points": 50,
+                    "expected_points": 200,
+                    "drift": -150,
+                    "expected_rate_pct": 4.0,
+                },
+            ]
+        },
+    }
+    result = annotate_banking("Some KB doc content.", state=state)
+    assert_contains(result, "DISPUTE CALCULATOR READY", "call-to-action surfaced")
+    assert_contains(result, "txn_1", "first txn_id surfaced")
+    assert_contains(result, "txn_2", "second txn_id surfaced")
+    assert_contains(result, "give_discoverable_user_tool", "instructs to call give")
+
+
+def test_annotator_dispute_call_to_action_suppressed_after_give():
+    section("test_annotator_dispute_call_to_action_suppressed — once given, no more nudge")
+    state = {
+        "unlocked_for_agent": set(),
+        "unlocked_for_user": {"submit_cash_back_dispute_0589"},  # ALREADY given
+        "verified_user_ids": set(),
+        "dispute_candidates_by_user": {
+            "u_xyz": [{"transaction_id": "txn_1", "credit_card_type": "Silver Rewards Card",
+                       "category": "Travel", "transaction_amount": 100.0,
+                       "actual_points": 100, "expected_points": 400,
+                       "drift": -300, "expected_rate_pct": 4.0}],
+        },
+    }
+    result = annotate_banking("Some KB doc content.", state=state)
+    assert_not_contains(result, "DISPUTE CALCULATOR READY", "nudge suppressed once given")
+
+
 def test_gate_post_give_falls_back_when_no_calculator_data():
     section("test_gate_post_give_falls_back — no calculator data, uses Commit 1 path")
     agent = create_custom_agent(tools=[], domain_policy="test")
@@ -860,6 +915,8 @@ def main():
     # Phase D: dispute calculator integration
     test_track_state_caches_dispute_candidates()
     test_gate_post_give_uses_dispute_calculator()
+    test_annotator_dispute_calculator_call_to_action()
+    test_annotator_dispute_call_to_action_suppressed_after_give()
     test_gate_post_give_falls_back_when_no_calculator_data()
 
     print(f"\n{'='*60}")

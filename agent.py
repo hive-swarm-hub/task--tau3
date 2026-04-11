@@ -387,6 +387,34 @@ def annotate_banking(content: str, state: dict | None = None) -> str:
                 f"Pass these EXACTLY — arg matching is strict equality."
             )
 
+    # PHASE D: when the calculator has identified dispute candidates but
+    # the agent has NOT yet called give_discoverable_user_tool, surface a
+    # high-priority CALL-TO-ACTION on every tool result. This addresses
+    # the failure mode where the LLM (task_018/021) calls
+    # get_credit_card_transactions_by_user, sees the data, but then either
+    # transfers to human or starts another KB search instead of taking
+    # the obvious next step. The annotator note keeps the directive
+    # visible until the LLM acts on it.
+    dispute_candidates_by_user = (state or {}).get("dispute_candidates_by_user", {}) or {}
+    unlocked_for_user_pending = (state or {}).get("unlocked_for_user", set()) or set()
+    if dispute_candidates_by_user and "submit_cash_back_dispute_0589" not in unlocked_for_user_pending:
+        # Find the first non-empty candidate list (one user_id will dominate)
+        for uid, candidates in dispute_candidates_by_user.items():
+            if not candidates:
+                continue
+            top = candidates[:6]
+            id_list = ", ".join(c["transaction_id"] for c in top)
+            annotations.append(
+                f"DISPUTE CALCULATOR READY: I have analyzed {uid}'s transactions and "
+                f"identified {len(candidates)} with incorrect cash back rewards "
+                f"(top {len(top)}: {id_list}). The CORRECT next step is:\n"
+                f"  1. Call give_discoverable_user_tool(discoverable_tool_name=\"submit_cash_back_dispute_0589\")\n"
+                f"  2. Tell the customer to submit each transaction_id one at a time\n"
+                f"DO NOT transfer to a human, do NOT search KB again, do NOT update transaction "
+                f"rewards directly — the customer must submit the disputes themselves via the user tool."
+            )
+            break
+
     # COMMIT 1: live user-side compliance status. When the customer has been
     # given a user-side tool, surface the running count of user calls so the
     # LLM can see how many disputes/submissions have actually landed and
