@@ -29,6 +29,11 @@ try:
         validate_tool_name,
         suggest_tools,
         render_prompt_section,
+        canonicalize_log_verification_args,
+        canonicalize_json_args,
+        SCENARIO_PLAYBOOKS,
+        match_scenario_playbook,
+        render_playbook_for_prompt,
     )
 except ImportError as e:
     print(f"ERROR: cannot import compass: {e}")
@@ -302,6 +307,135 @@ def test_missing_source_path():
     assert_eq(ok, False, "everything rejected")
 
 
+# ── Commit 2: argument canonicalization ─────────────────────────────────────
+
+def test_canonicalize_lv_time():
+    section("canonicalize_log_verification_args — time_verified pinned to oracle")
+    out = canonicalize_log_verification_args({"time_verified": "2024-06-15 12:00:00 UTC"})
+    assert_eq(out["time_verified"], "2025-11-14 03:40:00 EST", "stale time pinned to oracle")
+
+
+def test_canonicalize_lv_time_already_canonical():
+    section("canonicalize_log_verification_args — already-canonical time untouched")
+    out = canonicalize_log_verification_args({"time_verified": "2025-11-14 03:40:00 EST"})
+    assert_eq(out["time_verified"], "2025-11-14 03:40:00 EST", "unchanged")
+
+
+def test_canonicalize_lv_dob_formats():
+    section("canonicalize_log_verification_args — DOB normalization")
+    cases = [
+        ("8/11/1997", "08/11/1997"),
+        ("08/11/1997", "08/11/1997"),
+        ("1997-08-11", "08/11/1997"),
+        ("08-11-1997", "08/11/1997"),
+    ]
+    for inp, expected in cases:
+        out = canonicalize_log_verification_args({"date_of_birth": inp})
+        assert_eq(out["date_of_birth"], expected, f"{inp!r} → {expected!r}")
+
+
+def test_canonicalize_lv_phone_formats():
+    section("canonicalize_log_verification_args — phone normalization")
+    cases = [
+        ("713-555-0963", "713-555-0963"),
+        ("(713) 555-0963", "713-555-0963"),
+        ("+1 713 555 0963", "713-555-0963"),
+        ("17135550963", "713-555-0963"),
+        ("7135550963", "713-555-0963"),
+    ]
+    for inp, expected in cases:
+        out = canonicalize_log_verification_args({"phone_number": inp})
+        assert_eq(out["phone_number"], expected, f"{inp!r} → {expected!r}")
+
+
+def test_canonicalize_lv_passes_through_other_fields():
+    section("canonicalize_log_verification_args — non-target fields unchanged")
+    args = {
+        "name": "Amara Okonkwo",
+        "user_id": "755bcb4d5d",
+        "address": "305 Magnolia Street, Houston, TX 77002",
+        "email": "x@y.z",
+        "time_verified": "2025-11-14 03:40:00 EST",
+        "date_of_birth": "08/11/1997",
+        "phone_number": "713-555-0963",
+    }
+    out = canonicalize_log_verification_args(args)
+    for k in ("name", "user_id", "address", "email"):
+        assert_eq(out[k], args[k], f"{k} unchanged")
+
+
+def test_canonicalize_lv_idempotent():
+    section("canonicalize_log_verification_args — idempotent")
+    args = {
+        "time_verified": "2024-06-15 12:00:00 UTC",
+        "date_of_birth": "8/11/1997",
+        "phone_number": "+1 713 555 0963",
+    }
+    once = canonicalize_log_verification_args(args)
+    twice = canonicalize_log_verification_args(once)
+    assert_eq(once, twice, "second pass is a no-op")
+
+
+def test_canonicalize_json_args_dict():
+    section("canonicalize_json_args — dict → sorted compact string")
+    s = canonicalize_json_args({"b": 2, "a": 1, "c": [3, 2, 1]})
+    assert_eq(s, '{"a":1,"b":2,"c":[3,2,1]}', "sorted keys + compact separators")
+
+
+def test_canonicalize_json_args_string_canonicalizes_spacing():
+    section("canonicalize_json_args — string with stray whitespace canonicalized")
+    s = canonicalize_json_args('{"b":  2, "a":  1}')
+    assert_eq(s, '{"a":1,"b":2}', "whitespace stripped, keys sorted")
+
+
+def test_canonicalize_json_args_unparseable_string_passthrough():
+    section("canonicalize_json_args — unparseable string returned as-is")
+    s = canonicalize_json_args("not json")
+    assert_eq(s, "not json", "unchanged when not parseable")
+
+
+# ── Commit 2: scenario playbooks ────────────────────────────────────────────
+
+def test_scenario_playbook_match_payment_not_reflected():
+    section("match_scenario_playbook — task_033 11/13 incident")
+    pb = match_scenario_playbook(
+        "I paid my Bronze Rewards Card statement balance of $2,847.53 three days ago. "
+        "The payment was successfully deducted from my checking account but the balance "
+        "still shows the full statement balance as unpaid."
+    )
+    assert_true(pb is not None, "playbook matched")
+    seq = pb.get("required_sequence", [])
+    assert_true(len(seq) == 5, "5-step sequence")
+    # Order matters
+    names = [step[0] for step in seq]
+    assert_in("unlock_discoverable_agent_tool", names, "unlock present")
+    assert_in("call_discoverable_agent_tool", names, "call present")
+    assert_in("transfer_to_human_agents", names, "transfer present")
+
+
+def test_scenario_playbook_no_match():
+    section("match_scenario_playbook — generic message returns None")
+    pb = match_scenario_playbook("Hi, I want to change my email address")
+    assert_eq(pb, None, "no playbook for unrelated message")
+
+
+def test_scenario_playbook_match_min_keywords():
+    section("match_scenario_playbook — single keyword insufficient (min=2)")
+    pb = match_scenario_playbook("My statement is wrong")  # only "statement" matches
+    assert_eq(pb, None, "below threshold returns None")
+
+
+def test_render_playbook_for_prompt():
+    section("render_playbook_for_prompt — formatted output")
+    pb = SCENARIO_PLAYBOOKS["payment_not_reflected_incident"]
+    text = render_playbook_for_prompt(pb)
+    assert_in("SCENARIO PLAYBOOK MATCH", text, "header present")
+    assert_in("initial_transfer_to_human_agent_1822", text, "step 1 mentioned")
+    assert_in("initial_transfer_to_human_agent_0218", text, "step 2 mentioned")
+    assert_in("transfer_to_human_agents", text, "final transfer mentioned")
+    assert_in("EXACTLY in order", text, "ordering instruction present")
+
+
 # ── convenience module-level helpers ────────────────────────────────────────
 
 def test_convenience_helpers():
@@ -347,6 +481,21 @@ def main():
     test_render_prompt_section()
     test_missing_source_path()
     test_convenience_helpers()
+    # Commit 2: canonicalization
+    test_canonicalize_lv_time()
+    test_canonicalize_lv_time_already_canonical()
+    test_canonicalize_lv_dob_formats()
+    test_canonicalize_lv_phone_formats()
+    test_canonicalize_lv_passes_through_other_fields()
+    test_canonicalize_lv_idempotent()
+    test_canonicalize_json_args_dict()
+    test_canonicalize_json_args_string_canonicalizes_spacing()
+    test_canonicalize_json_args_unparseable_string_passthrough()
+    # Commit 2: scenario playbooks
+    test_scenario_playbook_match_payment_not_reflected()
+    test_scenario_playbook_no_match()
+    test_scenario_playbook_match_min_keywords()
+    test_render_playbook_for_prompt()
 
     print(f"\n{'='*60}")
     print(f"  {PASSED} passed, {FAILED} failed")
