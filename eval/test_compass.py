@@ -626,6 +626,190 @@ def test_convenience_helpers():
     assert_true("Discoverable tool catalog" in s, "render_prompt_section works")
 
 
+# ── framework reusability tests (post-refactor) ─────────────────────────────
+#
+# These tests close the "framework works without the data layer" gap that
+# the post-refactor smoke check left implicit. Each test exercises the
+# generic ToolCompass framework in a configuration that doesn't depend
+# on banking_knowledge data, proving that other τ²-bench domains can
+# adopt compass.py via their own compass_<domain>.py extension.
+
+def test_tool_compass_with_nonexistent_path_returns_empty():
+    """Framework gracefully degrades when domain data is missing.
+
+    Constructs a ToolCompass pointing at a non-existent tools.py and a
+    non-existent docs dir — simulates a brand-new τ²-bench domain that
+    hasn't been cloned yet. The framework should not raise; it should
+    return empty catalog/index/scenario data.
+    """
+    section("framework reusability — non-existent paths return empty defaults")
+    from pathlib import Path
+    bad = ToolCompass(
+        domain="airline",
+        tools_path=Path("/does/not/exist/airline_tools.py"),
+        docs_dir=Path("/does/not/exist/airline_docs"),
+    )
+    assert_eq(bad.domain, "airline", "domain string preserved")
+    assert_eq(bad.catalog["agent"], [], "agent tools empty")
+    assert_eq(bad.catalog["user"], [], "user tools empty")
+    assert_eq(bad.valid_names, set(), "no valid names")
+    # The rate_table delegates to a registered banking extension if loaded,
+    # but since this is a fresh ToolCompass with no extensions registered,
+    # it should return an empty dict not raise.
+    assert_eq(bad.rate_table, {}, "rate_table empty when no banking ext registered")
+    # The hallucination guard should reject everything (catalog is empty)
+    ok, reason = bad.validate("some_tool_0001")
+    assert_eq(ok, False, "validate rejects with empty catalog")
+    # suggest_tools should return [] not raise
+    matches = bad.suggest_tools("any text whatsoever")
+    assert_eq(matches, [], "suggest_tools empty with no scenario index")
+
+
+def test_tool_compass_extension_registration():
+    """Framework supports registering arbitrary domain extensions.
+
+    Constructs a ToolCompass for a hypothetical airline domain, registers
+    a stub extension following the same shape as BankingExtension, and
+    verifies the framework integrates it correctly.
+    """
+    section("framework reusability — hypothetical airline extension registration")
+    from pathlib import Path
+
+    # Hypothetical airline-domain extension (just enough to test the API)
+    class _AirlineExtension:
+        def __init__(self):
+            self._fare_table = None
+            self.scenario_playbooks = {
+                "delayed_flight_compensation": {
+                    "match_keywords": ["delayed", "compensation", "rebooking"],
+                    "match_min_keywords": 1,
+                    "description": "Hypothetical airline delay protocol",
+                    "required_sequence": [
+                        ("rebook_flight", {"reason": "delay"}),
+                    ],
+                }
+            }
+
+        @property
+        def fare_table(self) -> dict:
+            if self._fare_table is None:
+                self._fare_table = {("Economy", "Domestic"): 200, ("Business", "Domestic"): 800}
+            return self._fare_table
+
+        def canonicalize_log_verification_args(self, args):
+            # Airline-specific format would differ from banking; here we just
+            # ensure the registration mechanism doesn't care about the shape
+            return args
+
+    compass = ToolCompass(
+        domain="airline",
+        tools_path=Path("/does/not/exist/airline_tools.py"),
+        docs_dir=Path("/does/not/exist/airline_docs"),
+    )
+    assert_eq(compass.has_extension("airline"), False, "no extension before register")
+    assert_eq(compass.get_extension("airline"), None, "get_extension None before register")
+
+    ext = _AirlineExtension()
+    compass.register_extension("airline", ext)
+
+    assert_eq(compass.has_extension("airline"), True, "registered extension visible")
+    assert_eq(compass.get_extension("airline") is ext, True, "get_extension returns same instance")
+
+    # Verify the extension's data is accessible through the framework
+    retrieved = compass.get_extension("airline")
+    assert_eq(retrieved.fare_table[("Economy", "Domestic")], 200, "extension data accessible")
+    assert_eq(
+        list(retrieved.scenario_playbooks.keys()),
+        ["delayed_flight_compensation"],
+        "extension scenario_playbooks accessible",
+    )
+
+    # Multiple extensions can be registered side-by-side without colliding
+    class _RetailExtension:
+        def __init__(self):
+            self.return_window_days = 30
+    compass.register_extension("retail", _RetailExtension())
+    assert_eq(compass.has_extension("airline"), True, "airline still registered")
+    assert_eq(compass.has_extension("retail"), True, "retail also registered")
+    assert_eq(compass.get_extension("retail").return_window_days, 30, "retail data accessible")
+
+
+def test_compass_imports_succeed_without_banking_extension():
+    """compass.py imports cleanly even when compass_banking is unavailable.
+
+    The auto-registration block at the bottom of compass.py is wrapped
+    in try/except ImportError, so a swarm agent who deletes
+    compass_banking.py (or never had it) should still be able to
+    `import compass` and use the framework. The shim functions
+    (canonicalize_log_verification_args, compute_dispute_candidates,
+    parse_transactions_text) should return sensible defaults rather
+    than raising AttributeError when the banking extension is missing.
+
+    We can't actually delete compass_banking.py mid-test, but we CAN
+    construct a fresh ToolCompass with no extensions registered and
+    verify the shim functions return safe defaults when called against
+    that compass. Same code path as "compass_banking.py is missing".
+    """
+    section("framework reusability — shims return safe defaults without banking ext")
+    # Build an isolated ToolCompass that has no extensions registered.
+    # This simulates the "compass_banking.py was never imported" state.
+    isolated = ToolCompass(domain="airline")
+    assert_eq(isolated.has_extension("banking"), False, "isolated compass has no banking ext")
+    assert_eq(isolated.rate_table, {}, "rate_table empty without banking ext")
+
+    # The module-level shim functions in compass.py delegate to the
+    # singleton COMPASS, which DOES have banking registered (because we
+    # auto-load it at module init). So the shims will succeed there.
+    # But the shape we want to test is: if you imported compass.py
+    # without compass_banking.py present, would the shim defaults be
+    # correct? We test the underlying mechanism instead:
+    #
+    # Verify that COMPASS can have its banking extension temporarily
+    # removed and the shims still degrade gracefully.
+    saved_ext = COMPASS.get_extension("banking")
+    try:
+        COMPASS._extensions.pop("banking", None)
+        # Now call the shims and verify safe defaults
+        from compass import canonicalize_log_verification_args, compute_dispute_candidates, parse_transactions_text
+        args_passthrough = canonicalize_log_verification_args({"name": "Foo"})
+        assert_eq(args_passthrough, {"name": "Foo"}, "canonicalize shim is no-op without banking ext")
+        disputes = compute_dispute_candidates([{"transaction_id": "t1"}])
+        assert_eq(disputes, [], "compute_dispute_candidates shim returns [] without banking ext")
+        records = parse_transactions_text("some text")
+        assert_eq(records, [], "parse_transactions_text shim returns [] without banking ext")
+    finally:
+        # Restore the banking extension so subsequent tests don't break
+        if saved_ext is not None:
+            COMPASS.register_extension("banking", saved_ext)
+    # Sanity check: banking is back
+    assert_eq(COMPASS.has_extension("banking"), True, "banking ext restored after test")
+
+
+def test_match_scenario_playbook_with_explicit_playbooks():
+    """match_scenario_playbook accepts an explicit playbooks dict.
+
+    The framework function should work with any playbook source, not
+    just the registered banking extension's data. This proves the
+    function is generic and other domains can use it with their own
+    playbook collections.
+    """
+    section("framework reusability — match_scenario_playbook with explicit playbooks")
+    custom_playbooks = {
+        "stuck_elevator": {
+            "match_keywords": ["stuck", "elevator", "trapped"],
+            "match_min_keywords": 1,
+            "description": "Hypothetical elevator emergency protocol",
+            "required_sequence": [("call_maintenance", {"urgency": "high"})],
+        }
+    }
+    pb = match_scenario_playbook("I'm trapped in the elevator", playbooks=custom_playbooks)
+    assert_true(pb is not None, "matched custom playbook")
+    assert_in("elevator", pb["description"].lower(), "matched the right one")
+
+    no_match = match_scenario_playbook("I want to change my email", playbooks=custom_playbooks)
+    assert_eq(no_match, None, "no match for unrelated text")
+
+
 # ── runner ──────────────────────────────────────────────────────────────────
 
 def main():
@@ -680,6 +864,11 @@ def main():
     test_parse_transactions_text_real_format()
     test_parse_transactions_text_empty()
     test_parse_then_compute_end_to_end()
+    # Refactor: framework reusability gap
+    test_tool_compass_with_nonexistent_path_returns_empty()
+    test_tool_compass_extension_registration()
+    test_compass_imports_succeed_without_banking_extension()
+    test_match_scenario_playbook_with_explicit_playbooks()
 
     print(f"\n{'='*60}")
     print(f"  {PASSED} passed, {FAILED} failed")
