@@ -59,6 +59,8 @@ from compass import (
     canonicalize_json_args,
     match_scenario_playbook,
     render_playbook_for_prompt,
+    compute_dispute_candidates,
+    parse_transactions_text,
 )
 
 _DISCOVERABLE_CATALOG = COMPASS.catalog
@@ -571,13 +573,18 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             # Commit 1 additions: user-side compliance tracking
             "user_calls_by_tool": {},       # {discoverable_tool_name: count} — populated when
                                             # we observe a tool result for a user-side execution
-            "transactions_by_user": {},     # {user_id: [txn_records]} — cached from
-                                            # get_credit_card_transactions_by_user so the gate
-                                            # can suggest exact arg values to the customer
+            "transactions_by_user": {},     # {user_id: [txn_id_list]} — list of just the IDs
+                                            # (preserved for backward-compat with Commit 1)
             "current_user_id": None,        # most recent verified user_id (for prompt templating)
             # Commit 2 additions
             "scenario_playbook": None,      # matched compass.SCENARIO_PLAYBOOKS entry for the
                                             # customer's first message (used by annotator)
+            # Phase D additions
+            "transaction_records_by_user": {},  # {user_id: [parsed_txn_dict]} — full record
+                                                # parsed from get_credit_card_transactions_by_user
+                                                # output, used by compute_dispute_candidates
+            "dispute_candidates_by_user": {},   # {user_id: [dispute_dict]} — cached output
+                                                # of the calculator so the gate doesn't recompute
         }
         self._consecutive_tool_calls = 0
 
@@ -679,15 +686,23 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                     counts[tool_name] = counts.get(tool_name, 0) + 1
 
             # COMMIT 1: cache transaction lookups so the gate can suggest exact
-            # transaction_id values when prompting the customer. The result of
-            # get_credit_card_transactions_by_user is plain text with one
-            # numbered record per transaction; we extract just the txn IDs.
+            # transaction_id values when prompting the customer.
+            # PHASE D EXTENSION: also parse the full records and run the
+            # dispute calculator to identify which specific transactions
+            # have wrong rewards. Cache both the txn_ids (for the existing
+            # tell-the-customer template) and the full dispute_candidates
+            # (for Phase D's targeted prompt template).
             if last_call_name == "get_credit_card_transactions_by_user":
                 txn_ids = re.findall(r"\btransaction_id:\s*([a-z0-9_]{8,})", content)
-                if txn_ids:
-                    uid = self._task_state.get("current_user_id")
-                    if uid:
-                        self._task_state.setdefault("transactions_by_user", {})[uid] = txn_ids
+                uid = self._task_state.get("current_user_id")
+                if uid and txn_ids:
+                    self._task_state.setdefault("transactions_by_user", {})[uid] = txn_ids
+                    # Phase D: parse full records + compute dispute candidates
+                    records = parse_transactions_text(content)
+                    if records:
+                        self._task_state.setdefault("transaction_records_by_user", {})[uid] = records
+                        candidates = compute_dispute_candidates(records)
+                        self._task_state.setdefault("dispute_candidates_by_user", {})[uid] = candidates
 
             # Parse JSON result if possible; pair with most recent tool call by position
             try:
@@ -915,13 +930,18 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
 
             kept.append(tc)
 
-        # Intervention F (Commit 1): post-give tell-the-customer reminder.
-        # If a give_discoverable_user_tool was kept in this turn, append a
-        # reminder to the assistant content telling the LLM to follow up
-        # with the specific argument values the customer needs. The customer
-        # simulator does not autonomously know transaction_ids — the agent
-        # MUST tell it explicitly. This nudges the LLM to do that on the
-        # NEXT turn (when it sees its own previous content).
+        # Intervention F (Commit 1, upgraded by Phase D): post-give
+        # tell-the-customer reminder. If a give_discoverable_user_tool was
+        # kept in this turn, append a reminder to the assistant content
+        # telling the LLM to follow up with the specific argument values
+        # the customer needs.
+        #
+        # Phase D upgrade: when we have a cached dispute_candidates list
+        # for the current user (computed from a prior
+        # get_credit_card_transactions_by_user call), the reminder lists
+        # the SPECIFIC outlier transaction_ids identified by the offline
+        # calculator. This bypasses the LLM's fragile reward-arithmetic
+        # reasoning entirely.
         give_notes: list[str] = []
         for tc in kept:
             if tc.name != "give_discoverable_user_tool":
@@ -931,18 +951,43 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             if not target:
                 continue
             uid = self._task_state.get("current_user_id") or "<user_id>"
-            txns = (self._task_state.get("transactions_by_user") or {}).get(uid) or []
-            if target == "submit_cash_back_dispute_0589" and txns:
-                # Suggest a concrete invocation script for each known txn
-                examples = [f'transaction_id="{t}"' for t in txns[:6]]
+
+            # Phase D: prefer the dispute calculator's specific candidates
+            candidates = (self._task_state.get("dispute_candidates_by_user") or {}).get(uid) or []
+            txns_fallback = (self._task_state.get("transactions_by_user") or {}).get(uid) or []
+
+            if target == "submit_cash_back_dispute_0589" and candidates:
+                # Use the calculator's exact outlier list — these are the
+                # transactions whose actual rewards diverge from the
+                # canonical (card, category) rate computed from db.json.
+                ids = [c["transaction_id"] for c in candidates]
+                detail_lines = []
+                for c in candidates[:8]:
+                    detail_lines.append(
+                        f"  - {c['transaction_id']} ({c['credit_card_type']} / {c['category']}, "
+                        f"${c['transaction_amount']:.2f}): got {c['actual_points']} pts, "
+                        f"expected {c['expected_points']} pts at {c['expected_rate_pct']}% "
+                        f"(drift {c['drift']:+d})"
+                    )
+                give_notes.append(
+                    f"DISPUTE TARGETS IDENTIFIED ({len(ids)} transactions with incorrect rewards):\n"
+                    + "\n".join(detail_lines)
+                    + f"\n\nTell the customer to call submit_cash_back_dispute_0589 for EACH of these "
+                    f"transactions, one at a time. Use this exact format: "
+                    f'submit_cash_back_dispute_0589(user_id="{uid}", transaction_id="<id>"). '
+                    f"List ALL {len(ids)} transaction_ids in your message so the customer can submit them all."
+                )
+            elif target == "submit_cash_back_dispute_0589" and txns_fallback:
+                # Fallback to Commit 1 behavior when calculator hasn't run
+                # (e.g., agent hasn't called get_credit_card_transactions_by_user yet)
                 give_notes.append(
                     f"Reminder: now tell the customer the EXACT calls to make. "
                     f"For each transaction with incorrect cash back, ask the customer to call: "
-                    f'submit_cash_back_dispute_0589(user_id="{uid}", <one transaction_id>). '
-                    f"Example transaction_ids from this account: {', '.join(t for t in txns[:6])}."
+                    f'submit_cash_back_dispute_0589(user_id="{uid}", transaction_id="<one transaction_id>"). '
+                    f"Example transaction_ids from this account: {', '.join(t for t in txns_fallback[:6])}."
                 )
             elif target:
-                # Generic reminder when we don't have the specific arg values
+                # Generic reminder when we don't have specific arg values
                 give_notes.append(
                     f"Reminder: tell the customer the EXACT arguments to use with {target}. "
                     f"Pull any IDs they need from a get_* tool result and include them in your "

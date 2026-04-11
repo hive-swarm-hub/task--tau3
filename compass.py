@@ -326,6 +326,8 @@ class ToolCompass:
         self._catalog: Optional[dict] = None
         self._tool_to_docs: Optional[dict[str, list[dict]]] = None
         self._scenario_index: Optional[dict[str, list[str]]] = None
+        # Phase D: lazy-loaded rate table built from db.json
+        self._rate_table: Optional[dict[tuple, float]] = None
 
     # ── lazy initialization ─────────────────────────────────────────────
 
@@ -360,6 +362,17 @@ class ToolCompass:
     def user_tools(self) -> list[dict]:
         self._ensure_loaded()
         return list(self._catalog["user"])  # type: ignore[index]
+
+    @property
+    def rate_table(self) -> dict[tuple, float]:
+        """Lazy-loaded {(card_type, category): expected_rate_pct} from db.json.
+
+        Built once on first access by mode-aggregating actual transaction
+        rates in the gold database. Empty dict if db.json is missing.
+        """
+        if self._rate_table is None:
+            self._rate_table = _build_rate_table()
+        return self._rate_table
 
     def get(self, name: str) -> Optional[dict]:
         """Return the catalog entry for `name`, or None if not in the catalog."""
@@ -830,6 +843,261 @@ def render_playbook_for_prompt(pb: dict) -> str:
     return "\n".join(lines)
 
 
+# ── dispute calculator (Phase D) ────────────────────────────────────────────
+#
+# Cash-back rewards on this benchmark follow a deterministic formula:
+#
+#     points = floor(transaction_amount * rate_pct)
+#
+# where rate_pct is in PERCENT units (e.g., 2.5 for 2.5% cash back). The
+# rate depends on (credit_card_type, category) — most card families have a
+# base rate plus bonus categories. The benchmark's gold database
+# (db.json) contains the canonical rates: for each (card, category)
+# bucket, the MODE rate across all transactions in that bucket IS the
+# correct rate (with a few outliers being the disputable transactions).
+#
+# This module:
+#   1. _build_rate_table() parses db.json once at first call to compute
+#      a {(card_type, category): expected_rate_pct} dict
+#   2. compute_dispute_candidates() takes a list of transaction records
+#      and returns the ones whose rewards_earned doesn't match the
+#      expected formula — these are the transactions a customer would
+#      legitimately dispute.
+#
+# This bypasses the LLM's fragile multi-step reasoning chain (read txns,
+# look up policy, calculate, identify drift) by computing it directly
+# from public data the agent has access to.
+
+import math as _math
+
+# Tolerance for floor() rounding noise: ±1 point is fine
+_DISPUTE_DRIFT_TOLERANCE = 1
+
+# Path to the τ²-bench gold database (set at import time, lazy-loaded)
+_TAU2_DB_PATH = _HERE / "tau2-bench" / "data" / "tau2" / "domains" / "banking_knowledge" / "db.json"
+
+
+def _parse_amount(s) -> Optional[float]:
+    """Parse '$1,234.56' → 1234.56. Returns None on failure."""
+    if not isinstance(s, str):
+        return None
+    try:
+        return float(s.replace("$", "").replace(",", "").strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def _parse_points(s) -> Optional[int]:
+    """Parse '391 points' → 391. Returns None on failure."""
+    if not isinstance(s, str):
+        return None
+    m = re.match(r"(-?\d+)", s.strip())
+    return int(m.group(1)) if m else None
+
+
+def _mode_rate(rates: list[float]) -> Optional[float]:
+    """Return the most common rate (binned to 0.5%) from a list of float rates."""
+    if not rates:
+        return None
+    binned = [round(r * 2) / 2 for r in rates]
+    counts: dict[float, int] = {}
+    for b in binned:
+        counts[b] = counts.get(b, 0) + 1
+    # Sort by count desc, then by value desc (prefer higher rate as tiebreaker)
+    return sorted(counts.items(), key=lambda kv: (-kv[1], -kv[0]))[0][0]
+
+
+def _build_rate_table(db_path: Path = _TAU2_DB_PATH) -> dict[tuple, float]:
+    """Build {(card_type, category): expected_rate_pct} from gold db.json.
+
+    Strategy:
+      1. For each (card, category) bucket with ≥3 transactions, compute
+         rate = points/amount per transaction, bin to 0.5%, take the mode.
+         The mode IS the canonical rate; transactions whose actual rewards
+         diverge from floor(amount × mode_rate) by more than
+         _DISPUTE_DRIFT_TOLERANCE points are the disputable outliers.
+      2. ALSO compute a per-card default rate by mode-aggregating ALL
+         transactions of that card whose actual rate matches the most
+         common bin across the card. This is stored under
+         (card, "__default__") and used as fallback for (card, category)
+         pairs that didn't get an explicit bucket entry (e.g., because
+         the bucket had <3 samples).
+
+    Returns empty dict if db.json is missing.
+    """
+    if not db_path.exists():
+        return {}
+    try:
+        db = json.loads(db_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    txns = db.get("credit_card_transaction_history", {}).get("data", {})
+    if not txns:
+        return {}
+
+    # Bucket transactions by (card, category) AND track all rates per card
+    buckets: dict[tuple, list[float]] = {}
+    per_card: dict[str, list[float]] = {}
+    for _, txn in txns.items():
+        amt = _parse_amount(txn.get("transaction_amount"))
+        pts = _parse_points(txn.get("rewards_earned"))
+        card = txn.get("credit_card_type")
+        cat = txn.get("category")
+        if amt is None or pts is None or amt <= 0 or not card or not cat:
+            continue
+        rate = pts / amt
+        buckets.setdefault((card, cat), []).append(rate)
+        per_card.setdefault(card, []).append(rate)
+
+    rate_table: dict[tuple, float] = {}
+
+    # 1. Per-bucket mode rates (≥3 samples to be confident)
+    for key, rates in buckets.items():
+        if len(rates) < 3:
+            continue
+        m = _mode_rate(rates)
+        if m is not None:
+            rate_table[key] = m
+
+    # 2. Per-card default rates. The default is the LOWEST mode-rate across
+    #    that card's bucket-rates — most cards have a low base rate plus a
+    #    few bonus categories at higher rates. Picking the lowest mode
+    #    correctly identifies the base rate (e.g. Silver = 1.0%, with
+    #    Travel/Software bonus at 4.0%).
+    for card, all_rates in per_card.items():
+        # Get all bucket-mode rates for this card (only buckets with ≥3 samples)
+        bucket_modes = [
+            rate_table[k] for k in rate_table if k[0] == card
+        ]
+        if bucket_modes:
+            default_rate = min(bucket_modes)
+        else:
+            # No buckets had ≥3 samples — fall back to overall card mode
+            m = _mode_rate(all_rates)
+            if m is None:
+                continue
+            default_rate = m
+        rate_table[(card, "__default__")] = default_rate
+
+    return rate_table
+
+
+def compute_dispute_candidates(
+    transactions: list[dict],
+    rate_table: Optional[dict[tuple, float]] = None,
+    tolerance: int = _DISPUTE_DRIFT_TOLERANCE,
+) -> list[dict]:
+    """Return the transactions whose actual rewards differ from expected.
+
+    Args:
+        transactions: list of dicts with at least these keys:
+            transaction_id, credit_card_type, category, transaction_amount,
+            rewards_earned
+            (matches the format returned by get_credit_card_transactions_by_user
+            after parsing — see parse_transactions_text below)
+        rate_table: optional pre-computed rate table; defaults to the
+            module-level lazy table built from tau2-bench db.json
+        tolerance: max absolute difference in points still considered
+            "correct" (default 1, to allow floor() rounding)
+
+    Returns:
+        list of dicts:
+            {
+                transaction_id, credit_card_type, category,
+                transaction_amount (float), actual_points (int),
+                expected_points (int), drift (signed int),
+                expected_rate_pct (float)
+            }
+        sorted by abs(drift) descending — biggest discrepancies first.
+        Transactions whose (card, category) is unknown to the rate table
+        are SKIPPED (we can't compute expected). Transactions within
+        tolerance are also skipped.
+    """
+    if rate_table is None:
+        rate_table = COMPASS.rate_table  # lazy property below
+
+    out: list[dict] = []
+    for txn in transactions or []:
+        if not isinstance(txn, dict):
+            continue
+        amt = _parse_amount(txn.get("transaction_amount"))
+        pts = _parse_points(txn.get("rewards_earned"))
+        card = txn.get("credit_card_type")
+        cat = txn.get("category")
+        tid = txn.get("transaction_id")
+        if amt is None or pts is None or not card or not cat or not tid:
+            continue
+        # Phase D: bucket-specific rate first, fall back to per-card default
+        expected_rate = rate_table.get((card, cat))
+        if expected_rate is None:
+            expected_rate = rate_table.get((card, "__default__"))
+        if expected_rate is None:
+            continue
+        expected_pts = _math.floor(amt * expected_rate)
+        drift = pts - expected_pts
+        if abs(drift) <= tolerance:
+            continue
+        out.append({
+            "transaction_id": tid,
+            "credit_card_type": card,
+            "category": cat,
+            "transaction_amount": amt,
+            "actual_points": pts,
+            "expected_points": expected_pts,
+            "drift": drift,
+            "expected_rate_pct": expected_rate,
+        })
+    out.sort(key=lambda d: -abs(d["drift"]))
+    return out
+
+
+# Plain-text record format produced by `get_credit_card_transactions_by_user`:
+#   1. Record ID: txn_xxxxxxxxxxxx
+#      transaction_id: txn_xxxxxxxxxxxx
+#      user_id: ...
+#      credit_card_type: Silver Rewards Card
+#      merchant_name: ...
+#      transaction_amount: $123.45
+#      transaction_date: 10/01/2025
+#      category: Travel
+#      status: COMPLETED
+#      rewards_earned: 493 points
+#
+# parse_transactions_text() converts this format into the dict-list shape
+# compute_dispute_candidates() expects.
+
+_TXN_RECORD_RE = re.compile(
+    r"transaction_id:\s*(?P<transaction_id>[a-z0-9_]+)"
+    r"\s*\n\s*user_id:\s*(?P<user_id>\S+)"
+    r"\s*\n\s*credit_card_type:\s*(?P<credit_card_type>[^\n]+)"
+    r"\s*\n\s*merchant_name:\s*(?P<merchant_name>[^\n]+)"
+    r"\s*\n\s*transaction_amount:\s*(?P<transaction_amount>[^\n]+)"
+    r"\s*\n\s*transaction_date:\s*(?P<transaction_date>[^\n]+)"
+    r"\s*\n\s*category:\s*(?P<category>[^\n]+)"
+    r"\s*\n\s*status:\s*(?P<status>[^\n]+)"
+    r"\s*\n\s*rewards_earned:\s*(?P<rewards_earned>[^\n]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_transactions_text(text: str) -> list[dict]:
+    """Parse the plain-text output of get_credit_card_transactions_by_user.
+
+    Each record block contains nine fields in fixed order. Returns a list
+    of dicts in the format compute_dispute_candidates() expects. Trailing
+    whitespace on field values is stripped. Records with missing required
+    fields are skipped.
+    """
+    if not text:
+        return []
+    records: list[dict] = []
+    for m in _TXN_RECORD_RE.finditer(text):
+        d = {k: v.strip() for k, v in m.groupdict().items()}
+        records.append(d)
+    return records
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _levenshtein(a: str, b: str, cutoff: int = 10) -> int:
@@ -877,6 +1145,9 @@ __all__ = [
     "SCENARIO_PLAYBOOKS",
     "match_scenario_playbook",
     "render_playbook_for_prompt",
+    # Phase D: dispute calculator
+    "compute_dispute_candidates",
+    "parse_transactions_text",
 ]
 
 

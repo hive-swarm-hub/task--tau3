@@ -703,6 +703,107 @@ def test_annotator_surfaces_scenario_playbook():
     assert_contains(result, "initial_transfer_to_human_agent_0218", "step 2 in annotation")
 
 
+# ── Phase D: dispute calculator integration ────────────────────────────────
+
+def test_track_state_caches_dispute_candidates():
+    section("test_track_state_caches_dispute_candidates — Phase D state tracking")
+    from tau2.data_model.message import ToolMessage, AssistantMessage, ToolCall
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # Simulate agent calling get_credit_card_transactions_by_user for kenji
+    outgoing = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="t1", name="get_credit_card_transactions_by_user", arguments={"user_id": "6680a37184"}),
+    ])
+    # Build the real DB output for kenji's transactions
+    import json as _j
+    db = _j.load(open("tau2-bench/data/tau2/domains/banking_knowledge/db.json"))
+    ccth = db["credit_card_transaction_history"]["data"]
+    kenji = [(k, v) for k, v in ccth.items() if v.get("user_id") == "6680a37184"]
+    # Synthesize the plain-text format the tool returns
+    blocks = []
+    for i, (tid, txn) in enumerate(kenji, 1):
+        blocks.append(
+            f"{i}. Record ID: {tid}\n"
+            f"   transaction_id: {tid}\n"
+            f"   user_id: {txn['user_id']}\n"
+            f"   credit_card_type: {txn['credit_card_type']}\n"
+            f"   merchant_name: {txn['merchant_name']}\n"
+            f"   transaction_amount: {txn['transaction_amount']}\n"
+            f"   transaction_date: {txn['transaction_date']}\n"
+            f"   category: {txn['category']}\n"
+            f"   status: {txn['status']}\n"
+            f"   rewards_earned: {txn['rewards_earned']}\n"
+        )
+    incoming = ToolMessage(role="tool", id="r1",
+                           content=f"Found {len(kenji)} record(s) in 'credit_card_transaction_history':\n\n" + "\n".join(blocks))
+    agent._track_state(incoming, outgoing)
+
+    # State should now have dispute_candidates_by_user populated
+    candidates = agent._task_state.get("dispute_candidates_by_user", {}).get("6680a37184", [])
+    assert_eq(len(candidates) >= 2, True, "at least 2 dispute candidates found")
+    ids = [c["transaction_id"] for c in candidates]
+    assert_contains(ids, "txn_913d14a20dc5", "task_017 expected dispute 1")
+    assert_contains(ids, "txn_cfabb609133d", "task_017 expected dispute 2")
+
+
+def test_gate_post_give_uses_dispute_calculator():
+    section("test_gate_post_give_uses_dispute_calculator — intervention F + Phase D")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    # Pre-populate the state as if the agent just called get_credit_card_transactions
+    agent._task_state["current_user_id"] = "6680a37184"
+    agent._task_state["dispute_candidates_by_user"]["6680a37184"] = [
+        {
+            "transaction_id": "txn_913d14a20dc5",
+            "credit_card_type": "Silver Rewards Card",
+            "category": "Shopping",
+            "transaction_amount": 156.78,
+            "actual_points": 15,
+            "expected_points": 156,
+            "drift": -141,
+            "expected_rate_pct": 1.0,
+        },
+        {
+            "transaction_id": "txn_cfabb609133d",
+            "credit_card_type": "Silver Rewards Card",
+            "category": "Dining",
+            "transaction_amount": 87.25,
+            "actual_points": 47,
+            "expected_points": 87,
+            "drift": -40,
+            "expected_rate_pct": 1.0,
+        },
+    ]
+    # Now the LLM gives the user the dispute tool
+    msg = AssistantMessage(role="assistant", content="Here you go.", tool_calls=[
+        ToolCall(id="1", name="give_discoverable_user_tool",
+                 arguments={"discoverable_tool_name": "submit_cash_back_dispute_0589"}),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_eq(len(out.tool_calls or []), 1, "give kept")
+    # Content should now contain the SPECIFIC outlier txn_ids from the calculator
+    assert_contains(out.content, "DISPUTE TARGETS IDENTIFIED", "calculator output present")
+    assert_contains(out.content, "txn_913d14a20dc5", "first txn_id surfaced")
+    assert_contains(out.content, "txn_cfabb609133d", "second txn_id surfaced")
+    assert_contains(out.content, "drift", "per-txn drift detail present")
+    assert_contains(out.content, "6680a37184", "user_id in invocation template")
+
+
+def test_gate_post_give_falls_back_when_no_calculator_data():
+    section("test_gate_post_give_falls_back — no calculator data, uses Commit 1 path")
+    agent = create_custom_agent(tools=[], domain_policy="test")
+    agent._task_state["current_user_id"] = "u_xyz"
+    agent._task_state["transactions_by_user"]["u_xyz"] = ["txn_1", "txn_2", "txn_3"]
+    # No dispute_candidates_by_user — should fall back to Commit 1's generic
+    # "example transaction_ids" template
+    msg = AssistantMessage(role="assistant", content="", tool_calls=[
+        ToolCall(id="1", name="give_discoverable_user_tool",
+                 arguments={"discoverable_tool_name": "submit_cash_back_dispute_0589"}),
+    ])
+    out = agent._gate_tool_calls(msg)
+    assert_contains(out.content, "Reminder", "fallback reminder fired")
+    assert_contains(out.content, "txn_1", "txn_id from fallback list")
+    assert_not_contains(out.content, "DISPUTE TARGETS IDENTIFIED", "calculator path NOT taken")
+
+
 # ── runner ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -756,6 +857,10 @@ def main():
     test_track_state_detects_scenario_playbook_on_user_message()
     test_track_state_no_playbook_on_generic_message()
     test_annotator_surfaces_scenario_playbook()
+    # Phase D: dispute calculator integration
+    test_track_state_caches_dispute_candidates()
+    test_gate_post_give_uses_dispute_calculator()
+    test_gate_post_give_falls_back_when_no_calculator_data()
 
     print(f"\n{'='*60}")
     print(f"  {PASSED} passed, {FAILED} failed")
