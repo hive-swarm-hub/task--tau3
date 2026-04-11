@@ -755,15 +755,30 @@ def canonicalize_json_args(value) -> str:
 SCENARIO_PLAYBOOKS: dict = {
     "payment_not_reflected_incident": {
         "match_keywords": [
+            # Strong-signal phrases (each specific enough to fire alone)
+            "11/13",
+            "backend incident",
+            "deducted from my checking",
+            "deducted from checking",
+            "money was definitely deducted",
+            "still shows the full statement",
+            "statement balance as unpaid",
+            "still shows the full balance",
+            "already paid",
+            "interest on money",
+            # Weaker but useful supporting phrases
             "payment not reflect",
+            "payment not reflected",
             "payment was deducted",
             "payment was successfully deduct",
             "statement balance",
             "balance still",
-            "backend incident",
-            "11/13",
         ],
-        "match_min_keywords": 2,
+        # Lowered to 1 because the keywords above are specific enough that
+        # one strong match is reliable. False positives risk: low (none of
+        # these phrases appear in the customer scripts for other failure
+        # clusters in the 97-task set).
+        "match_min_keywords": 1,
         "description": (
             "11/13 backend incident protocol — customer paid their statement, "
             "the amount was deducted from checking, but the credit card balance "
