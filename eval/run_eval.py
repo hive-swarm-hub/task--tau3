@@ -26,10 +26,16 @@ MODEL = os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
 USER_MODEL = os.environ.get("USER_MODEL", "gpt-4.1-2025-04-14")
 # τ²-bench's stock max_concurrency is 3 (set in config.py). The eval is
 # API-bound (not CPU-bound) so we can run many simulations in parallel
-# without contention. Bumping to 12 cuts a full 97-task eval from ~60min
-# to ~15-18min on the OpenAI tier most agents are using. Override via
-# the EVAL_CONCURRENCY env var if you hit rate limits.
-MAX_CONCURRENCY = int(os.environ.get("EVAL_CONCURRENCY", "12"))
+# without contention. Concurrency=8 keeps peak TPM ~1.3M (2/3 of the 2M
+# gpt-4.1-mini ceiling), so retries absorb spikes and no tasks get
+# excluded as infra errors; full 97-task eval ~24min. Override via the
+# EVAL_CONCURRENCY env var.
+# NOTE: concurrency=12 (the previous value) is ~16min wall time but hits
+# TPM saturation — run_generic_full.log had 27/97 tasks excluded as
+# infra errors (TPM RateLimit) — so the pass^1 denominator was silently
+# shrunk. If OpenAI raises the org's TPM limit, revert to 12.
+# MAX_CONCURRENCY = int(os.environ.get("EVAL_CONCURRENCY", "12"))
+MAX_CONCURRENCY = int(os.environ.get("EVAL_CONCURRENCY", "8"))
 
 # ── CURATED LITE EVAL (the 20-task fast inner loop) ─────────────────────────
 #
