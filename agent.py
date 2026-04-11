@@ -59,9 +59,13 @@ from compass import (
     canonicalize_json_args,
     match_scenario_playbook,
     render_playbook_for_prompt,
-    compute_dispute_candidates,
-    parse_transactions_text,
 )
+
+# Banking-specific hooks live on an extension plugged into COMPASS. If the
+# banking extension is not registered (e.g., running this scaffold on a
+# different domain) _BANKING_EXT is None and the agent falls back to
+# generic behavior — the hook call sites all no-op safely in that case.
+_BANKING_EXT = COMPASS.get_extension("banking") if COMPASS.has_extension("banking") else None
 
 _DISCOVERABLE_CATALOG = COMPASS.catalog
 _CATALOG_PROMPT_SECTION = COMPASS.render_prompt_section()
@@ -395,25 +399,17 @@ def annotate_banking(content: str, state: dict | None = None) -> str:
     # transfers to human or starts another KB search instead of taking
     # the obvious next step. The annotator note keeps the directive
     # visible until the LLM acts on it.
-    dispute_candidates_by_user = (state or {}).get("dispute_candidates_by_user", {}) or {}
-    unlocked_for_user_pending = (state or {}).get("unlocked_for_user", set()) or set()
-    if dispute_candidates_by_user and "submit_cash_back_dispute_0589" not in unlocked_for_user_pending:
-        # Find the first non-empty candidate list (one user_id will dominate)
-        for uid, candidates in dispute_candidates_by_user.items():
-            if not candidates:
-                continue
-            top = candidates[:6]
-            id_list = ", ".join(c["transaction_id"] for c in top)
-            annotations.append(
-                f"DISPUTE CALCULATOR READY: I have analyzed {uid}'s transactions and "
-                f"identified {len(candidates)} with incorrect cash back rewards "
-                f"(top {len(top)}: {id_list}). The CORRECT next step is:\n"
-                f"  1. Call give_discoverable_user_tool(discoverable_tool_name=\"submit_cash_back_dispute_0589\")\n"
-                f"  2. Tell the customer to submit each transaction_id one at a time\n"
-                f"DO NOT transfer to a human, do NOT search KB again, do NOT update transaction "
-                f"rewards directly — the customer must submit the disputes themselves via the user tool."
-            )
-            break
+    #
+    # Domain-specific formatting lives on the banking extension; other
+    # domains plug in their own. When no banking extension is registered
+    # this falls through and no annotation is emitted.
+    if _BANKING_EXT is not None:
+        unlocked_for_user_pending = (state or {}).get("unlocked_for_user", set()) or set()
+        calc_note = _BANKING_EXT.format_calculator_ready_annotation(
+            state or {}, unlocked_for_user_pending
+        )
+        if calc_note:
+            annotations.append(calc_note)
 
     # COMMIT 1: live user-side compliance status. When the customer has been
     # given a user-side tool, surface the running count of user calls so the
@@ -608,11 +604,12 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             "scenario_playbook": None,      # matched compass.SCENARIO_PLAYBOOKS entry for the
                                             # customer's first message (used by annotator)
             # Phase D additions
-            "transaction_records_by_user": {},  # {user_id: [parsed_txn_dict]} — full record
-                                                # parsed from get_credit_card_transactions_by_user
-                                                # output, used by compute_dispute_candidates
-            "dispute_candidates_by_user": {},   # {user_id: [dispute_dict]} — cached output
-                                                # of the calculator so the gate doesn't recompute
+            # Phase D fields: populated by the banking extension's
+            # hook_on_tool_result when get_credit_card_transactions_by_user
+            # lands. Kept declared here so annotate_banking / gate code can
+            # read them uniformly via the extension's state_field_* helpers.
+            "transaction_records_by_user": {},  # {user_id: [parsed_txn_dict]}
+            "dispute_candidates_by_user": {},   # {user_id: [dispute_dict]}
         }
         self._consecutive_tool_calls = 0
 
@@ -714,23 +711,27 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                     counts[tool_name] = counts.get(tool_name, 0) + 1
 
             # COMMIT 1: cache transaction lookups so the gate can suggest exact
-            # transaction_id values when prompting the customer.
-            # PHASE D EXTENSION: also parse the full records and run the
-            # dispute calculator to identify which specific transactions
-            # have wrong rewards. Cache both the txn_ids (for the existing
-            # tell-the-customer template) and the full dispute_candidates
-            # (for Phase D's targeted prompt template).
+            # transaction_id values when prompting the customer. This
+            # lightweight id-only cache is domain-agnostic (generic regex)
+            # so it stays inline here.
             if last_call_name == "get_credit_card_transactions_by_user":
                 txn_ids = re.findall(r"\btransaction_id:\s*([a-z0-9_]{8,})", content)
                 uid = self._task_state.get("current_user_id")
                 if uid and txn_ids:
                     self._task_state.setdefault("transactions_by_user", {})[uid] = txn_ids
-                    # Phase D: parse full records + compute dispute candidates
-                    records = parse_transactions_text(content)
-                    if records:
-                        self._task_state.setdefault("transaction_records_by_user", {})[uid] = records
-                        candidates = compute_dispute_candidates(records)
-                        self._task_state.setdefault("dispute_candidates_by_user", {})[uid] = candidates
+
+            # PHASE D: domain-specific tool-result hook. Banking's extension
+            # uses this to parse the transaction record text and run the
+            # offline dispute calculator, caching candidates into state
+            # under its own field names. Other domains plug in different
+            # behavior under the same hook. No-op if no extension.
+            if _BANKING_EXT is not None and last_call_name:
+                _BANKING_EXT.hook_on_tool_result(
+                    last_call_name,
+                    content,
+                    self._task_state.get("current_user_id"),
+                    self._task_state,
+                )
 
             # Parse JSON result if possible; pair with most recent tool call by position
             try:
@@ -915,11 +916,10 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             # user-side counter says the customer hasn't called it enough
             # times yet.
             #
-            # Concrete pairing rules (tight to avoid false positives):
-            #   user gave: submit_cash_back_dispute_0589
-            #     blocks agent: update_transaction_rewards_*  (the cleanup pair)
-            #   user gave: deposit_check_3847
-            #     blocks agent: apply_*_account_credit_*      (the same idea)
+            # The pairing table is DOMAIN-SPECIFIC — it comes from the
+            # registered extension (banking plugs in its cash-back and
+            # deposit rules). Other domains register their own extension
+            # with a `phase2_pairs` property. Empty dict when no extension.
             #
             # If the user has called the user-side tool at least once we let
             # the agent-side cleanup through (the customer might really be
@@ -927,10 +927,7 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             # The check fires only when zero user-side calls have been
             # observed since the give — that's the hardest signal of
             # premature Phase-2 cleanup.
-            phase2_pairs = {
-                "submit_cash_back_dispute_0589": ("update_transaction_rewards_",),
-                "deposit_check_3847": ("apply_checking_account_credit_", "apply_savings_account_credit_"),
-            }
+            phase2_pairs = _BANKING_EXT.phase2_pairs if _BANKING_EXT is not None else {}
             if name == "call_discoverable_agent_tool" and isinstance(args, dict):
                 target_tool = args.get("agent_tool_name") or ""
                 user_calls = self._task_state.get("user_calls_by_tool", {})
@@ -980,40 +977,37 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                 continue
             uid = self._task_state.get("current_user_id") or "<user_id>"
 
-            # Phase D: prefer the dispute calculator's specific candidates
-            candidates = (self._task_state.get("dispute_candidates_by_user") or {}).get(uid) or []
-            txns_fallback = (self._task_state.get("transactions_by_user") or {}).get(uid) or []
-
-            if target == "submit_cash_back_dispute_0589" and candidates:
-                # Use the calculator's exact outlier list — these are the
-                # transactions whose actual rewards diverge from the
-                # canonical (card, category) rate computed from db.json.
-                ids = [c["transaction_id"] for c in candidates]
-                detail_lines = []
-                for c in candidates[:8]:
-                    detail_lines.append(
-                        f"  - {c['transaction_id']} ({c['credit_card_type']} / {c['category']}, "
-                        f"${c['transaction_amount']:.2f}): got {c['actual_points']} pts, "
-                        f"expected {c['expected_points']} pts at {c['expected_rate_pct']}% "
-                        f"(drift {c['drift']:+d})"
+            # Phase D: prefer the domain extension's targeted formatter
+            # (banking computes exact dispute outliers from the cached
+            # calculator state). When the formatter returns None, fall
+            # back to the generic txn-id hint or the bare reminder.
+            domain_note = None
+            if _BANKING_EXT is not None:
+                candidates = _BANKING_EXT.get_dispute_candidates(self._task_state, uid)
+                if candidates:
+                    domain_note = _BANKING_EXT.format_dispute_targets_message(
+                        target, candidates, uid
                     )
-                give_notes.append(
-                    f"DISPUTE TARGETS IDENTIFIED ({len(ids)} transactions with incorrect rewards):\n"
-                    + "\n".join(detail_lines)
-                    + f"\n\nTell the customer to call submit_cash_back_dispute_0589 for EACH of these "
-                    f"transactions, one at a time. Use this exact format: "
-                    f'submit_cash_back_dispute_0589(user_id="{uid}", transaction_id="<id>"). '
-                    f"List ALL {len(ids)} transaction_ids in your message so the customer can submit them all."
-                )
-            elif target == "submit_cash_back_dispute_0589" and txns_fallback:
+
+            if domain_note:
+                give_notes.append(domain_note)
+            elif target == "submit_cash_back_dispute_0589":
                 # Fallback to Commit 1 behavior when calculator hasn't run
                 # (e.g., agent hasn't called get_credit_card_transactions_by_user yet)
-                give_notes.append(
-                    f"Reminder: now tell the customer the EXACT calls to make. "
-                    f"For each transaction with incorrect cash back, ask the customer to call: "
-                    f'submit_cash_back_dispute_0589(user_id="{uid}", transaction_id="<one transaction_id>"). '
-                    f"Example transaction_ids from this account: {', '.join(t for t in txns_fallback[:6])}."
-                )
+                txns_fallback = (self._task_state.get("transactions_by_user") or {}).get(uid) or []
+                if txns_fallback:
+                    give_notes.append(
+                        f"Reminder: now tell the customer the EXACT calls to make. "
+                        f"For each transaction with incorrect cash back, ask the customer to call: "
+                        f'submit_cash_back_dispute_0589(user_id="{uid}", transaction_id="<one transaction_id>"). '
+                        f"Example transaction_ids from this account: {', '.join(t for t in txns_fallback[:6])}."
+                    )
+                else:
+                    give_notes.append(
+                        f"Reminder: tell the customer the EXACT arguments to use with {target}. "
+                        f"Pull any IDs they need from a get_* tool result and include them in your "
+                        f"next message — the customer cannot guess the right values."
+                    )
             elif target:
                 # Generic reminder when we don't have specific arg values
                 give_notes.append(

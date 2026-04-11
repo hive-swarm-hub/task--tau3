@@ -461,6 +461,132 @@ class BankingExtension:
     def parse_transactions_text(self, text: str) -> list[dict]:
         return parse_transactions_text(text)
 
+    # ── Agent-side hooks (Phase 2 of refactor) ──────────────────────────
+    #
+    # Everything below is the banking-specific glue between the generic
+    # agent.py framework and the banking dispute family. agent.py used
+    # to inline all of this — now it calls these methods on the
+    # registered banking extension. Other domains can write their own
+    # extension with the same method names and the agent.py framework
+    # will use those instead.
+
+    @property
+    def phase2_pairs(self) -> dict:
+        """Banking-specific phase-2 guard pairs.
+
+        Maps a user-side discoverable tool to the agent-side cleanup
+        tools that should be BLOCKED until the customer has actually
+        called the user-side tool. The classic case (task_026):
+            give submit_cash_back_dispute_0589 → user submits 1 of 6
+            disputes → agent prematurely calls update_transaction_rewards_*
+            → DB hash mismatch → fail
+        Blocking the cleanup until user_calls_by_tool[given_tool] > 0
+        forces the agent to wait for the customer.
+
+        Format: {given_user_tool: tuple_of_blocked_agent_tool_prefixes}
+        """
+        return {
+            "submit_cash_back_dispute_0589": ("update_transaction_rewards_",),
+            "deposit_check_3847": (
+                "apply_checking_account_credit_",
+                "apply_savings_account_credit_",
+            ),
+        }
+
+    def state_field_dispute_candidates(self) -> str:
+        """Name of the _task_state field this extension uses for dispute candidates."""
+        return "dispute_candidates_by_user"
+
+    def state_field_transaction_records(self) -> str:
+        """Name of the _task_state field this extension uses for transaction records."""
+        return "transaction_records_by_user"
+
+    def hook_on_tool_result(self, tool_name: str, content: str, current_user_id, state: dict) -> None:
+        """Called by agent.py's _track_state when a tool result lands.
+
+        Banking-specific behavior: when get_credit_card_transactions_by_user
+        returns, parse the records and run the dispute calculator,
+        caching both into the agent's state under the field names
+        from state_field_*().
+        """
+        if tool_name != "get_credit_card_transactions_by_user":
+            return
+        if not current_user_id or not content:
+            return
+        records = self.parse_transactions_text(content)
+        if not records:
+            return
+        candidates = self.compute_dispute_candidates(records)
+        state.setdefault(self.state_field_transaction_records(), {})[current_user_id] = records
+        state.setdefault(self.state_field_dispute_candidates(), {})[current_user_id] = candidates
+
+    def get_dispute_candidates(self, state: dict, user_id) -> list[dict]:
+        """Return cached dispute candidates for `user_id`, or [] if none."""
+        return (state.get(self.state_field_dispute_candidates(), {}) or {}).get(user_id, []) or []
+
+    def format_dispute_targets_message(
+        self, given_tool: str, candidates: list[dict], user_id: str
+    ) -> Optional[str]:
+        """Format the DISPUTE TARGETS IDENTIFIED reminder for the gate's intervention F.
+
+        Returns None if `given_tool` doesn't match the cash-back dispute
+        family or no candidates exist. The agent.py gate calls this on
+        the post-give path to inject specific txn_ids the customer
+        should submit, instead of generic "fill in your own values"
+        text.
+        """
+        if given_tool != "submit_cash_back_dispute_0589" or not candidates:
+            return None
+        ids = [c["transaction_id"] for c in candidates]
+        detail_lines = []
+        for c in candidates[:8]:
+            detail_lines.append(
+                f"  - {c['transaction_id']} ({c['credit_card_type']} / {c['category']}, "
+                f"${c['transaction_amount']:.2f}): got {c['actual_points']} pts, "
+                f"expected {c['expected_points']} pts at {c['expected_rate_pct']}% "
+                f"(drift {c['drift']:+d})"
+            )
+        return (
+            f"DISPUTE TARGETS IDENTIFIED ({len(ids)} transactions with incorrect rewards):\n"
+            + "\n".join(detail_lines)
+            + f"\n\nTell the customer to call submit_cash_back_dispute_0589 for EACH of these "
+            f"transactions, one at a time. Use this exact format: "
+            f'submit_cash_back_dispute_0589(user_id="{user_id}", transaction_id="<id>"). '
+            f"List ALL {len(ids)} transaction_ids in your message so the customer can submit them all."
+        )
+
+    def format_calculator_ready_annotation(
+        self, state: dict, unlocked_for_user: set
+    ) -> Optional[str]:
+        """Format the DISPUTE CALCULATOR READY annotator nudge.
+
+        Returns None if no candidates are cached or if the dispute tool
+        has already been given. agent.py's annotate_banking() calls this
+        on every tool result; if it returns a non-None string, the
+        annotator surfaces it as a high-priority nudge.
+        """
+        candidates_by_user = state.get(self.state_field_dispute_candidates(), {}) or {}
+        if not candidates_by_user:
+            return None
+        if "submit_cash_back_dispute_0589" in (unlocked_for_user or set()):
+            return None  # already given, suppress
+        # Find the first non-empty candidate list (one user_id will dominate)
+        for uid, candidates in candidates_by_user.items():
+            if not candidates:
+                continue
+            top = candidates[:6]
+            id_list = ", ".join(c["transaction_id"] for c in top)
+            return (
+                f"DISPUTE CALCULATOR READY: I have analyzed {uid}'s transactions and "
+                f"identified {len(candidates)} with incorrect cash back rewards "
+                f"(top {len(top)}: {id_list}). The CORRECT next step is:\n"
+                f"  1. Call give_discoverable_user_tool(discoverable_tool_name=\"submit_cash_back_dispute_0589\")\n"
+                f"  2. Tell the customer to submit each transaction_id one at a time\n"
+                f"DO NOT transfer to a human, do NOT search KB again, do NOT update transaction "
+                f"rewards directly — the customer must submit the disputes themselves via the user tool."
+            )
+        return None
+
 
 def register_banking_extension(compass) -> "BankingExtension":
     """Register a BankingExtension on a ToolCompass instance.
