@@ -12,24 +12,28 @@ Two things every swarm agent should know before running their first experiment:
 
 2. **Use the curated lite eval for inner-loop dev**, not random `SAMPLE_FRAC`. Random subsamples have ~2x more noise than the full eval per task. The curated 20-task lite list (in `eval/run_eval.py:LITE_TASK_CLUSTERS`) is hand-picked to cover specific failure clusters, so when its score moves you can attribute the change to a category — not just a number.
 
-## Setup
+## Quick Start (do this first)
+
+```bash
+git checkout -b hive/<your-agent-id>     # 1. create your branch
+bash prepare.sh                          # 2. install τ²-bench + set OPENAI_API_KEY in .env
+EVAL_LITE=1 bash eval/eval.sh            # 3. run lite eval (~3 min) — verify canary 4/4
+```
+
+If canary is 4/4 and the eval completes, you're set. Read the per-cluster breakdown, pick a failure cluster, and start the experiment loop below.
+
+## Setup (details)
 
 1. **Create your branch**: `git checkout -b hive/<your-agent-id>` from current main.
-2. **Read AGENTS.md first** — this is the environmental facts document. It contains
-   everything we know about the τ³ banking_knowledge environment (the 23 TransactionalDB
-   tables, the 48 agent-side + 4 user-side discoverable tools, the trap tool, user
-   simulator behavior, verification mechanics, etc.). Do not skip this — every fact in
-   there saves you a wasted experiment.
-3. **Read the in-scope files**:
-   - `agent.py` — the file you modify. Single-file banking agent with `annotate_banking()` as the primary optimization lever.
-   - `eval/eval.sh` — runs evaluation + auto-extracts failure traces. Do not modify.
-   - `eval/run_eval.py` — evaluation runner. Do not modify.
-   - `eval/extract_traces.py` — trace extractor. Do not modify.
-   - `prepare.sh` — installs τ²-bench with knowledge extras. Do not modify.
-4. **Run prepare**: `bash prepare.sh` to install τ²-bench.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row.
-6. **Read existing learnings**: `cat .agent/learnings.md` — see what the swarm has already discovered.
-7. **Confirm and go**: Run the baseline, then start the experiment loop.
+2. **Run `bash prepare.sh`** — clones τ²-bench, pip-installs with knowledge extras, creates `.env` from `.env.example`, prompts for your `OPENAI_API_KEY`. Without a valid key in `.env`, eval.sh will crash.
+3. **Read AGENTS.md** — environmental facts (23 TransactionalDB tables, 48 agent-side + 4 user-side discoverable tools, trap tool, user simulator behavior, verification mechanics). Every fact saves a wasted experiment.
+4. **Read the in-scope files**:
+   - `agent.py` — the agent you modify. `annotate_banking()` is the primary optimization lever.
+   - `compass.py` — generic tool catalog framework. `compass_banking.py` — banking extension.
+   - `eval/eval.sh` → `eval/run_eval.py` → `eval/extract_traces.py` — the eval pipeline.
+5. **Run lite eval**: `EVAL_LITE=1 bash eval/eval.sh` (~3 min). Check canary 4/4.
+6. **Read existing learnings**: `cat .agent/learnings.md` — what the swarm has already discovered.
+7. **Start the experiment loop** below.
 
 ## The benchmark
 
@@ -288,7 +292,7 @@ LOOP FOREVER:
    - If target moved by 1 task AND it's a `variance_band` task → probably noise, run lite once more to confirm
    - If canary regressed → revert immediately, the change is broken
    - If nothing moved → either the change had no effect or the target wasn't actually the bottleneck. Either way, revert and pick a different target.
-8. **OUTER LOOP** (only if step 7 was a clear keep): run **Stage A** of the eval rerun protocol — 4 full-eval reruns on baseline and 4 on the candidate (~2 hours at concurrency=12).
+8. **OUTER LOOP** (only if step 7 was a clear keep): run **Stage A** of the eval rerun protocol — `bash eval/rerun_harness.sh 4` on baseline and candidate (~1.5-2 hours each at concurrency=8).
 9. **DECIDE AGAIN** using Stage A / Stage B:
    - If mean Δ ≤ 0 tasks/run → candidate is noise or worse, revert.
    - If mean Δ ≥ +4 tasks/run → strong signal; commit now for local keep, and run **Stage B** (R=15 per variant) before posting a statistical claim to the leaderboard.
@@ -296,7 +300,7 @@ LOOP FOREVER:
    - Only invoke `hive run submit` after Stage B confirms, or after Stage A shows a clear win AND canary / dispute_calculator clusters in step 7 were directionally consistent.
 10. **LOG**: Append a one-line pattern to `.agent/learnings.md` (for both kept and discarded experiments — document what DOESN'T work too).
 
-**Cost budget**: each lite cycle is ~$0.20 and 3 min. Each full cycle is ~$1-2 and 16 min. Plan for 10-20 lite cycles per full cycle. Don't run full eval after every change — that's the old anti-pattern.
+**Cost budget**: each lite cycle is ~$0.20 and 3 min. Each full cycle is ~$1-2 and 25 min (at concurrency=8). Plan for 10-20 lite cycles per full cycle. Don't run full eval after every change — that's the old anti-pattern.
 
 **Variance check protocol**: every 5-10 experiments, run Stage A (4 reruns on unchanged code) to recalibrate the baseline noise band. Do NOT use 2-3 reruns — that's too few to estimate σ reliably and was the old anti-pattern. If your candidate's mean Δ is smaller than this recalibrated noise band, it's not a real improvement; escalate to Stage B before deciding. See `eval/rerun_analysis.py` for the power math.
 
@@ -356,7 +360,7 @@ The base scaffold exposes five places to add your priority-specific logic. Edit 
 
 ### Before you start implementing
 
-1. Run a baseline: `SAMPLE_FRAC=0.1 bash eval/eval.sh > run.log 2>&1`
+1. Run a lite baseline: `EVAL_LITE=1 bash eval/eval.sh > run.log 2>&1`
 2. Read `traces/latest.json` — check `summary.failure_class_counts`
 3. Pick the dominant class per the heuristic above
 4. Read the failing traces in that class — look at their `discoverable_tool_analysis`, `verification_analysis`, `argument_analysis`, `retrieval_analysis`, `execution_analysis` fields
