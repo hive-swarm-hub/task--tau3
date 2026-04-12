@@ -420,6 +420,50 @@ def parse_transactions_text(text: str) -> list[dict]:
     return records
 
 
+# ── KB-mined account_class map ───────────────────────────────────────────────
+#
+# `open_bank_account_4821`'s docstring says account_class is "The full official
+# account class name" — no enum. The valid values live in KB doc filenames:
+#   doc_<account_type>_accounts_<slug>_NNN.json
+# We mine the mapping at import time so the gate can validate first-call args.
+
+def _mine_account_class_map(docs_dir: Path = _TAU2_BANKING_DOCS_DIR) -> dict[str, list[str]]:
+    """Scan KB doc filenames for valid (account_type → account_class) pairs."""
+    if not docs_dir.is_dir():
+        return {}
+    pattern = re.compile(
+        r"^doc_(checking|savings|business_checking|business_savings)_accounts_"
+        r"([a-z0-9_\-]+?)(?:_\((?:checking|savings|general)\))?"
+        r"_\d+\.json$"
+    )
+    mapping: dict[str, set[str]] = {}
+    for fname in sorted(docs_dir.iterdir()):
+        m = pattern.match(fname.name)
+        if not m:
+            continue
+        category, slug = m.group(1), m.group(2)
+        # Skip general overview docs and joint-holder docs
+        if "general" in slug or "joint" in slug or slug.endswith("_accounts"):
+            continue
+        # Normalize slug: "green_fee-free_account" → "Green Fee-Free Account"
+        tokens = slug.replace("_", " ").split()
+        parts = []
+        for tok in tokens:
+            if "-" in tok:
+                parts.append("-".join(p.capitalize() for p in tok.split("-")))
+            else:
+                parts.append(tok.capitalize())
+        name = " ".join(parts)
+        # Ensure trailing " Account" for consistency with oracle expectations
+        if not name.lower().endswith(" account"):
+            name = f"{name} Account"
+        mapping.setdefault(category, set()).add(name)
+    return {k: sorted(v) for k, v in sorted(mapping.items())}
+
+
+_ACCOUNT_CLASS_MAP: dict[str, list[str]] = _mine_account_class_map()
+
+
 # ── extension class (the registration hook into ToolCompass) ────────────────
 
 class BankingExtension:
@@ -460,6 +504,53 @@ class BankingExtension:
 
     def parse_transactions_text(self, text: str) -> list[dict]:
         return parse_transactions_text(text)
+
+    @property
+    def account_class_map(self) -> dict[str, list[str]]:
+        """KB-mined {account_type: [valid_account_class]} for open_bank_account_4821."""
+        return _ACCOUNT_CLASS_MAP
+
+    def extra_enum_constraints(self, tool_name: str, inner_args_str: str) -> dict[str, list[str]]:
+        """Return additional enum constraints not derivable from docstrings.
+
+        Called by agent.py's Intervention H after compass.enum_constraints()
+        to inject banking-specific validations. Currently handles
+        `account_class` for `open_bank_account_4821`, which is conditional
+        on the `account_type` argument (the docstring lists account_type
+        enums but not account_class).
+        """
+        if tool_name != "open_bank_account_4821" or not self.account_class_map:
+            return {}
+        try:
+            kwargs = json.loads(inner_args_str)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        if not isinstance(kwargs, dict):
+            return {}
+        acct_type = kwargs.get("account_type")
+        if not isinstance(acct_type, str):
+            return {}
+        valid = self.account_class_map.get(acct_type)
+        if valid:
+            return {"account_class": valid}
+        return {}
+
+    def render_account_class_prompt_section(self) -> str:
+        """Render valid account_class values as a system-prompt section."""
+        if not self.account_class_map:
+            return ""
+        lines = [
+            "## Valid `account_class` values for `open_bank_account_4821`",
+            "",
+            "Pick from this list — the action matcher scores the FIRST call attempt:",
+            "",
+        ]
+        for acct_type in ("checking", "savings", "business_checking", "business_savings"):
+            values = self.account_class_map.get(acct_type, [])
+            if not values:
+                continue
+            lines.append(f"- `account_type=\"{acct_type}\"`: {', '.join(values)}")
+        return "\n".join(lines)
 
     # ── Agent-side hooks (Phase 2 of refactor) ──────────────────────────
     #
