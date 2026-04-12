@@ -55,10 +55,45 @@ significant +2 task lift given observed noise (three identical runs gave 8, 7,
   tool (not discoverable), so the enum gate does not intercept it. A separate
   pre-validation path for base tool enums would be needed.
 
+## Interventions Registry (shipped 2026-04-12)
+
+The 9 existing inline interventions in `agent.py` (A through I, grep'd from
+`# Intervention` comments) were extracted into `interventions_banking.py` and
+wired through a new `InterventionRegistry` framework at `interventions.py`.
+The gate and gate_post dispatch loops now iterate `REGISTRY.for_hook(...)`
+instead of an elif cascade. See `docs/interventions_inventory.md` for the
+full per-intervention spec.
+
+Hook types: `prompt`, `annotator`, `gate_pre`, `gate_post`, `state_track`,
+`tool_result`. The annotator hook is defined in the framework but existing
+annotator signals remain inline in `annotate_banking` — registering them as
+metadata-only (`apply=None`) was rejected because it provides false
+discoverability without dispatch. Future work: extract each annotator signal
+into a callable and register it under `hook="annotator"`.
+
+Two new experimental interventions landed alongside the framework:
+- **J (prefer-discoverable-reads)**: rewrites base-tool reads to unlock the
+  discoverable variant when it's been mentioned in KB. Targets brian2's
+  49-occurrence action-match miss on `get_bank_account_transactions_9173`.
+- **K (verify-before-mutate)**: blocks mutation calls when `verified_user_ids`
+  is empty. Written by a fresh agent (charlie) using only framework docs —
+  validated the new-agent onboarding path.
+
+The framework rejects duplicate IDs, validates hook/status at registration,
+and the CLI `scripts/list_interventions.py` auto-imports all
+`interventions_*.py` files for standalone discoverability.
+
 ## Historical artifacts (discarded)
 
 The following docs were consolidated and deleted: `program_md_review.md` (6
 contradictions found and fixed in program.md), `sijun_slack_reply.md` (three
 draft variants of a slack post about the lite eval), `gpt_deep_research_prompt.md`
 (the self-contained prompt used to generate the rerun protocol analysis),
-`hive_announcement.md` (draft skill/feed announcements for compass.py).
+`hive_announcement.md` (draft skill/feed announcements for compass.py),
+`INVENTORY_INDEX.md` (duplicate of interventions_inventory.md),
+`hook_type_audit.md` (the audit's findings are reflected in the final hook
+set), `intervention_impact_methodology.md` (one-paragraph; methodology lives
+in program.md's Stage A/B section), `new_agent_experience_report.md`
+(charlie's journey — friction points addressed in program.md docs),
+`registry_integration_report.md` (pre-fix integration report superseded by
+the fixes in this commit), `INTERVENTIONS_SUMMARY.txt` (root-level noise).

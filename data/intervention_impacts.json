@@ -1,0 +1,93 @@
+{
+  "_meta": {
+    "schema_version": "1.0",
+    "generated_at": "2026-04-11",
+    "baseline_sha": "0d3e76ac",
+    "baseline_score": "7/97 (0.0722)",
+    "baseline_variance": "8/97, 8/97, 7/97 on identical code (junjie post #10/#11); brian independently reproduced 9/97 on full eval in post #15 — documented noise band is ~6–10 tasks per full run (\u00b12 tasks)",
+    "lite_eval_size": 20,
+    "full_eval_size": 97,
+    "notes": "Most interventions A-G shipped bundled in the first submission (junjie commit 0d3e76a, 'compass.py + 7 gate interventions'). Individual A/B isolation was never performed. Later interventions (H, I, enum+account_class) have somewhat cleaner attribution because they landed on top of the 0d3e76a baseline. 'unknown' is used instead of null to keep rendering simple."
+  },
+  "A": {
+    "name": "dedupe-unlock",
+    "lite_delta_tasks": "unknown",
+    "full_delta_tasks": "+0 (no measurable db_match effect)",
+    "verified_sha": "0d3e76ac",
+    "confidence": "single-run-bundled",
+    "evidence_url": ".agent/learnings.md NEG entry (commit e2d9e27); hive feed post #8",
+    "caveats": "Shipped bundled with B/C/D/E/F/G as 'compass.py + 7 gate interventions'; no A/B isolation. Learnings file explicitly notes A+B together produce negligible db_match effect; rationale is stall-prevention, not score. Prevents task_021-style retry loops."
+  },
+  "B": {
+    "name": "dedupe-give",
+    "lite_delta_tasks": "unknown",
+    "full_delta_tasks": "+0 (no measurable db_match effect)",
+    "verified_sha": "0d3e76ac",
+    "confidence": "single-run-bundled",
+    "evidence_url": ".agent/learnings.md NEG entry (commit e2d9e27); hive feed post #8",
+    "caveats": "Shipped bundled with A (same commit, same NEG learning). The learnings file couples A and B explicitly: 'Dropping redundant unlock/give calls at the gate level (interventions A & B) does not improve pass rate; at best it prevents task_021-style stalls.'"
+  },
+  "C": {
+    "name": "canonicalize-json-args",
+    "lite_delta_tasks": "unknown",
+    "full_delta_tasks": "+1 to +2 (JSON format fix alone)",
+    "verified_sha": "bd7d9cd8",
+    "confidence": "single-run (but mechanism-clean)",
+    "evidence_url": "hive feed posts #27 and #28 (junjie session summary)",
+    "caveats": "Originally shipped in 0d3e76a at 7/97 using COMPACT JSON separators. Junjie later discovered in experiment J/K/L that compact separators produced '{\"key\":\"val\"}' when the oracle expects '{\"key\": \"val\"}' (standard json.dumps spacing). After the fix: 8/97 -> 9/97 (run bd7d9cd8, +1-2 over 7/97 baseline). Upper edge of the 6-10 noise band; mechanism-clean (every canonicalizer firing was producing a string mismatch before). Identified as real signal in post #28: 'genuine bug fix affecting all canonicalized args'."
+  },
+  "D": {
+    "name": "hallucination-guard",
+    "lite_delta_tasks": "unknown",
+    "full_delta_tasks": "+0 (hygiene only)",
+    "verified_sha": "0d3e76ac",
+    "confidence": "single-run-bundled (mechanism confirmed)",
+    "evidence_url": ".agent/learnings.md PATTERN entry (commit e2d9e27); hive feed post #8",
+    "caveats": "Mechanism verified: 0 hallucinated unlock/give attempts across all 91 failures in full eval (previously observed change_user_email_9921, submit_business_checking_account_referral_lime_green_003). Score unchanged vs stock (6/97 -> 6/97) — hallucinations are not the dominant failure class. Structural hygiene win, not a score mover."
+  },
+  "E": {
+    "name": "phase2-guard",
+    "lite_delta_tasks": "regressed 2->0 on dispute_calculator cluster in brian2's v2 tightening (post #16)",
+    "full_delta_tasks": "+0 to +2 (disputed — see caveats)",
+    "verified_sha": "0d3e76ac (original); 76536bab (brian2 tightened v2)",
+    "confidence": "single-run-bundled for original; brian2 retracted v2 claim in post #16",
+    "evidence_url": "hive feed posts #8, #14, #16, #21",
+    "caveats": "Original E (user_calls==0 check) shipped bundled in 0d3e76a. Brian2 tightened E in post #14 to require user_calls >= min(len(candidates), 4), reported 9/97 (+2 over 7/97 baseline), but retracted in post #16 after lite-eval showed dispute_calculator cluster regressed 2->0 (task_017 and task_018 flipped) and after brian independently reproduced 0d3e76a at 9/97 in post #15. Brian2 explicitly wrote 'my change is sitting inside the 6-9 baseline variance band, not above it... the fix is UNVERIFIED.' Brian2's follow-up escape-hatch variant freed 6 infinite-loop tasks (task_027/028/043/044/080/084) but freed tasks still failed on partial execution (post #21, 7/97 overall). The original E remains in agent.py; the tightened v2 was reverted."
+  },
+  "F": {
+    "name": "post-give-reminder",
+    "lite_delta_tasks": "dispute_calculator cluster moved from 0/5 (stock) to 1/5 on junjie c5aa2cf lite eval",
+    "full_delta_tasks": "+1 structural (task_017 first-ever pass tied to this + Phase D calculator)",
+    "verified_sha": "0d3e76ac",
+    "confidence": "single-run-bundled, mechanism-attributed",
+    "evidence_url": "hive feed posts #8, #10, #12",
+    "caveats": "Shipped with Phase D dispute calculator (commit c3dd939 + ba46f90). Junjie post #8: 'task_017 PASSED (first time ever in this repo) — Phase D dispute calculator correctly identified both expected transaction_ids and the gate auto-injected them'. Win is reproducible because tied to specific code path (offline math-based dispute calculator), not prompt-tuning."
+  },
+  "G": {
+    "name": "canonicalize-log-verification-args",
+    "lite_delta_tasks": "unknown",
+    "full_delta_tasks": "unknown (bundled, no isolated measurement)",
+    "verified_sha": "0d3e76ac",
+    "confidence": "single-run-bundled",
+    "evidence_url": "hive feed post #8 (listed as intervention G in the original 7-intervention bundle)",
+    "caveats": "Normalizes time_verified to '2025-11-14 03:40:00 EST', DOB to MM/DD/YYYY, phone to XXX-XXX-XXXX. Shipped bundled with A-F; no A/B isolation available. Format normalization is a well-understood τ²-bench failure mode (action matcher is string-exact) but the specific delta attributable to G alone was not measured."
+  },
+  "H": {
+    "name": "enum-pre-validation",
+    "lite_delta_tasks": "unknown",
+    "full_delta_tasks": "+0 to +2 (observable inside noise band)",
+    "verified_sha": "76536bab -> 7edf50cc (brian2)",
+    "confidence": "single-run (top of noise band)",
+    "evidence_url": "hive feed posts #15 (brian's trace-level diagnosis), #17, #19 (brian2's shipped version)",
+    "caveats": "Brian's post #15 identified the enum-surfacing mechanism from task_058/task_075 traces (wrong account_class enum on first call, matcher scored only first attempt). Brian2 landed gate-level H on top of the baseline; reached 10/97 in post #18/#19 when combined with intervention I. H alone vs H+I not isolated. 9 blocked_enum_violation events fired across failure traces (mostly task_082 pin_compromised, using compass's pre-existing constraints). Mechanism is mechanically clean but score impact is 'plausible, not statistically confirmed' — brian2 explicitly stated 'NOT statistically confirmed without more trials' and stopped due to $20 budget."
+  },
+  "I": {
+    "name": "account-class-map",
+    "lite_delta_tasks": "unknown",
+    "full_delta_tasks": "+1 (10/97 vs 9/97 baseline — top of noise band, not stat-confirmed)",
+    "verified_sha": "7edf50cc (brian2)",
+    "confidence": "single-run (top of noise band)",
+    "evidence_url": "hive feed post #19 (brian2 INTERVENTION I writeup); hive run submission 7edf50cc",
+    "caveats": "Shipped with H as a combined 'KB-mined account_class + prompt injection + gate validation' change. Score 10/97 = 0.1031 on full eval vs brian's reproduced 9/97 baseline = +1 task, inside but at top of the 6-10 variance band. Mechanism evidence is clean (traces show task_058 changed 'Green Account' -> valid 'Green Account (savings)'; task_075 changed 'World Blue Account' invalid-for-checking -> valid 'Bluest Account'), but residual failure on those tasks is REASONING (customer said 'Preference for Premium' -> expected 'Silver Account'), not format. Brian2: 'I am stepping back rather than burning another 1.50 dollars to confirm'. Upper bound on direct conversions is small because format-miss is tail failure, not head failure."
+  }
+}
