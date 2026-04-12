@@ -569,6 +569,12 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
         # Substitute the catalog into the base instructions. The catalog is
         # built at module import time from tau2-bench source.
         instructions = BASE_INSTRUCTIONS.replace("{CATALOG}", _CATALOG_PROMPT_SECTION)
+        # Inject domain-specific enum hints from the extension (e.g.,
+        # banking's KB-mined account_class map for open_bank_account_4821).
+        if _BANKING_EXT is not None and hasattr(_BANKING_EXT, "render_account_class_prompt_section"):
+            acct_section = _BANKING_EXT.render_account_class_prompt_section()
+            if acct_section:
+                instructions = instructions + "\n\n" + acct_section
         return SYSTEM_TEMPLATE.format(
             instructions=instructions,
             policy=self.domain_policy,
@@ -896,6 +902,59 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                             "reason": "canonicalized_json_arguments",
                             "target": args.get("agent_tool_name") or args.get("discoverable_tool_name") or "?",
                         })
+
+            # Intervention H: enum pre-validation for call_discoverable_agent_tool.
+            # τ²-bench's action matcher scores the FIRST call attempt — if
+            # the LLM sends an invalid enum value (e.g., account_type="premium")
+            # the task is marked failed even if the LLM retries with a correct
+            # value later. We already detect enum constraints in the annotator
+            # (Intervention C) but don't enforce them at the gate. This closes
+            # the detect→enforce gap.
+            #
+            # compass.enum_constraints(tool) parses "one of ..." clauses from
+            # the tool's docstring and returns {param: [valid_values]}. When
+            # the LLM's proposed arguments contain an out-of-set value, we
+            # drop the call and inject a correction note listing the valid
+            # values. Domain-agnostic — works for any tool with enum docstrings.
+            if name == "call_discoverable_agent_tool" and isinstance(args, dict):
+                target_tool = args.get("agent_tool_name") or ""
+                inner_str = args.get("arguments")
+                if target_tool and isinstance(inner_str, str) and inner_str:
+                    constraints = COMPASS.enum_constraints(target_tool)
+                    # Let the banking extension inject additional constraints
+                    # not derivable from docstrings (e.g., account_class).
+                    if _BANKING_EXT is not None and hasattr(_BANKING_EXT, "extra_enum_constraints"):
+                        extra = _BANKING_EXT.extra_enum_constraints(target_tool, inner_str)
+                        if extra:
+                            constraints = {**constraints, **extra}
+                    if constraints:
+                        try:
+                            inner_kwargs = json.loads(inner_str)
+                        except (json.JSONDecodeError, TypeError):
+                            inner_kwargs = None
+                        if isinstance(inner_kwargs, dict):
+                            violations = []
+                            for param, valid in constraints.items():
+                                got = inner_kwargs.get(param)
+                                if got is not None and got not in valid:
+                                    violations.append((param, got, valid))
+                            if violations:
+                                details = "; ".join(
+                                    f"{p} must be one of {v} but got {g!r}"
+                                    for p, g, v in violations
+                                )
+                                log.append({
+                                    "turn": turn,
+                                    "reason": "blocked_enum_violation",
+                                    "target": target_tool,
+                                    "violations": [{"param": p, "got": g} for p, g, _ in violations],
+                                })
+                                drop_notes.append(
+                                    f"Blocked {target_tool}: {details}. "
+                                    f"Retry with a valid value — the action matcher scores "
+                                    f"the FIRST call attempt."
+                                )
+                                continue
 
             # Intervention E (Commit 1): Phase-2 guard.
             # If the agent is about to call an agent-side mutation that pairs
