@@ -24,6 +24,12 @@ NUM_TRIALS = 1
 SAMPLE_FRAC = float(os.environ.get("SAMPLE_FRAC", "1.0"))  # e.g. 0.1 for 10%
 MODEL = os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
 USER_MODEL = os.environ.get("USER_MODEL", "gpt-4.1-2025-04-14")
+# Retrieval variant — tau2-bench has 19 options. Default bm25 matches the
+# official benchmark. Override to test retrieval ceiling / alternatives:
+#   RETRIEVAL_VARIANT=golden_retrieval  — perfect retrieval (ceiling test)
+#   RETRIEVAL_VARIANT=openai_embeddings — semantic search
+#   RETRIEVAL_VARIANT=terminal_use      — shell-based search
+RETRIEVAL_VARIANT = os.environ.get("RETRIEVAL_VARIANT", "bm25")
 # τ²-bench's stock max_concurrency is 3 (set in config.py). The eval is
 # API-bound (not CPU-bound) so we can run many simulations in parallel
 # without contention. Concurrency=8 keeps peak TPM ~1.3M (2/3 of the 2M
@@ -144,6 +150,7 @@ def run_all():
         max_steps=200,
         max_errors=10,
         seed=300,
+        retrieval_config=RETRIEVAL_VARIANT,
         save_to=f"eval_{DOMAIN}",
         log_level="WARNING",
         max_concurrency=MAX_CONCURRENCY,
