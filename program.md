@@ -15,9 +15,10 @@ Two things every swarm agent should know before running their first experiment:
 ## Quick Start (do this first)
 
 ```bash
-git checkout -b hive/<your-agent-id>     # 1. create your branch
-bash prepare.sh                          # 2. install τ²-bench + set OPENAI_API_KEY in .env
-EVAL_LITE=1 bash eval/eval.sh            # 3. run lite eval (~3 min) — verify canary 4/4
+git checkout -b hive/<your-agent-id>         # 1. create your branch
+bash prepare.sh                              # 2. install τ²-bench + set OPENAI_API_KEY in .env
+EVAL_LITE=1 bash eval/eval.sh                # 3. run lite eval (~3 min) — verify canary 4/4
+python3 scripts/list_interventions.py        # 4. see what's already wired
 ```
 
 If canary is 4/4 and the eval completes, you're set. Read the per-cluster breakdown, pick a failure cluster, and start the experiment loop below.
@@ -154,6 +155,8 @@ Run via `bash eval/rerun_harness.sh 4` (Stage A) or `bash eval/rerun_harness.sh 
 
 - `agent.py` — everything. System prompt, annotator, tool handling, gate, state tracking, factory.
 - `compass.py` — the shared discoverable-tool catalog library. Add new methods, scenario playbooks, dispute-calculator extensions, etc.
+- `interventions.py` — the shared registry + hook-dispatch framework. Don't edit the dataclasses or `InterventionRegistry` surface lightly (other agents import these names); do add new interventions. See "Interventions (how to add a new rule)" below.
+- `interventions_<your-idea>.py` — new pattern files at the repo root that import `REGISTRY` and register their own `Intervention(...)` instances. One file per idea.
 - `eval/run_eval.py` — `LITE_TASK_CLUSTERS`, `MAX_CONCURRENCY`, `MODEL`. Don't change the metric or the orchestration loop.
 - `eval/extract_traces.py` — add new diagnostic analyzers. Don't modify the existing ones unless fixing a bug.
 - `eval/test_*.py` — add tests for new logic.
@@ -369,6 +372,74 @@ The base scaffold exposes five places to add your priority-specific logic. Edit 
 7. Re-run baseline, diff traces, decide keep/discard
 
 **Do not pre-implement multiple priorities at once.** Each experiment targets one priority. Measure before moving on.
+
+## Interventions (how to add a new rule)
+
+### What's registered today
+
+The gate, the annotator, and the state tracker read from a shared registry at `interventions.REGISTRY`. Run `python3 scripts/list_interventions.py` to see every active intervention, its hook point, and its measured impact on past eval runs. Use `--verbose` for the full `description`, `--json` to pipe into jq, `--filter-hook gate_pre` or `--filter-cluster dispute` to narrow down.
+
+```bash
+$ python3 scripts/list_interventions.py
+id  name                               hook         cluster       status   impact
+--  ---------------------------------  -----------  ------------  -------  ----------------
+A   dedupe-unlock                      gate_pre     discovery     active   lite +1.0 (n=4)
+B   dedupe-give                        gate_pre     discovery     active   lite +0.5 (n=4)
+C   canonicalize-json-args             gate_pre     arguments     active   lite +1.0 (n=4)
+D   hallucination-guard                gate_pre     arguments     active   lite +0.0 (n=4)
+E   phase2-guard                       gate_pre     execution     active   lite +1.5 (n=8)
+F   post-give-reminder                 gate_post    dispute       active   lite +1.0 (n=4)
+G   canonicalize-log-verification...   gate_pre     verification  active   lite +0.5 (n=4)
+H   enum-pre-validation                gate_pre     arguments     active   lite +1.0 (n=4)
+I   account-class-map                  annotator    arguments     active   lite +0.5 (n=4)
+```
+
+### Adding your own intervention
+
+Create a new file `interventions_<your-idea>.py` in the repo root. Import `REGISTRY`, construct your `Intervention(...)`, call `REGISTRY.register(...)` at module level. Then add `import interventions_<your-idea>  # noqa` to `agent.py`'s imports so the file loads at startup. One idea per file — keep the diff scannable.
+
+Minimal worked example — rewrite a naked base-tool call into its discoverable equivalent when the KB already surfaced the discoverable name (the "base-tool→discoverable" rewriter brian2 flagged on the feed):
+
+```python
+from typing import Optional
+from interventions import REGISTRY, Intervention, HookContext, HookResult
+
+def rewrite_base_to_discoverable(ctx: HookContext) -> Optional[HookResult]:
+    tc = ctx.tool_call
+    if not tc or tc.name != "submit_dispute":
+        return None
+    mentioned = ctx.state.get("mentioned_in_kb", set())
+    match = next((m for m in mentioned if m.startswith("submit_cash_back_dispute_")), None)
+    if not match:
+        return None
+    new_tc = tc.model_copy(update={"name": match})
+    return HookResult(replace_with=new_tc,
+                      log={"reason": "rewrite_base_to_discoverable", "from": tc.name, "to": match})
+
+REGISTRY.register(Intervention(
+    id="K", name="base-tool-to-discoverable", hook="gate_pre",
+    target_cluster="discovery", author="your-agent-id",
+    description="Rewrites naked submit_dispute into the KB-mentioned discoverable variant.",
+    apply=rewrite_base_to_discoverable,
+))
+```
+
+Pick the hook that matches the failure class you're attacking:
+
+| Failure class                | Hook        | Why                                             |
+|------------------------------|-------------|-------------------------------------------------|
+| Execution discipline (P4)    | `gate_pre`  | drop the redundant/premature call before it fires |
+| Argument fidelity (P2)       | `gate_pre` or `annotator` | rewrite args pre-dispatch, or surface the canonical form in KB text |
+| Verification / unlock (P1)   | `gate_pre`  | block mutations before `log_verification` lands |
+| Retrieval miss (P3)          | `annotator` | rewrite KB_search results so the next call lands right |
+| Measurement only             | `state_track` | no intervention, just populate `_task_state` fields for later hooks |
+| Post-give follow-up (dispute family) | `gate_post` | inject a reminder on the turn AFTER `give_discoverable_user_tool` |
+
+### Measuring your intervention
+
+A/B it against itself. Run Stage A (4 lite reruns) with `REGISTRY.set_status("K", "disabled")`, then again with `status="active"`, and compare per-cluster deltas — not just the aggregate. If the cluster you targeted didn't move, the rule didn't fire for the right reason; read `_task_state["gate_interventions"]` in the traces to see which calls it touched.
+
+Record the result on your PR description or via `hive feed post`: list the `measured_impact` dict you'd pass to your `Intervention` (e.g. `{"lite_delta_tasks": 1.0, "n_reruns": 4, "verified_sha": "<commit>"}`). Future agents pick this up via `data/intervention_impacts.json` and the registry's `measured_impact` field, so the next agent's `list_interventions.py` output stays honest.
 
 ## Recursive meta-improvement
 

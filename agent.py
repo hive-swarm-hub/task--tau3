@@ -61,6 +61,12 @@ from compass import (
     render_playbook_for_prompt,
 )
 
+# Intervention registry — wire up the 9 banking interventions at import time.
+# ``interventions_banking`` registers each one into REGISTRY; the gate below
+# iterates REGISTRY.for_hook(...) instead of the old inline elif-cascade.
+from interventions import REGISTRY, HookContext  # noqa: F401
+import interventions_banking  # noqa: F401  (side effect: registrations)
+
 # Banking-specific hooks live on an extension plugged into COMPASS. If the
 # banking extension is not registered (e.g., running this scaffold on a
 # different domain) _BANKING_EXT is None and the agent falls back to
@@ -748,7 +754,13 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
         shows up in the next LLM context as the content of the assistant
         turn. This breaks the retry loop.
 
-        Current interventions:
+        The gate is driven by :mod:`interventions.REGISTRY`. Each of the
+        interventions below is registered in ``interventions_banking.py`` and
+        applied in registration order. To discover / toggle / extend them
+        programmatically, use ``REGISTRY.list()``, ``REGISTRY.get(id)``,
+        or ``REGISTRY.set_status(id, ...)``.
+
+        Currently registered interventions:
 
         A. DROP the duplicate-meta-tool pattern
            If the LLM tries to `unlock_discoverable_agent_tool(X)` for a tool
@@ -790,274 +802,60 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
         if not assistant_msg.tool_calls:
             return assistant_msg
 
-        unlocked_agent = self._task_state.get("unlocked_for_agent", set())
-        unlocked_user = self._task_state.get("unlocked_for_user", set())
-        mentioned_in_kb = self._task_state.get("mentioned_in_kb", set())
         kept: list[ToolCall] = []
         drop_notes: list[str] = []
         log = self._task_state.setdefault("gate_interventions", [])
-        turn = self._task_state.get("turn_count", 0)
 
+        # gate_pre: iterate REGISTRY.for_hook("gate_pre") per tool call.
+        # Order: G → D → A/B → C → H → E (preserved from inline version).
+        # Interventions may:
+        #   - return HookResult(drop=True, drop_note, log) → drop the call
+        #   - return HookResult(replace_with=new_tc, log)  → rewrite (next intv sees rewrite)
+        #   - return None                                   → no-op, continue
+        pre_hooks = REGISTRY.for_hook("gate_pre")
         for tc in assistant_msg.tool_calls:
-            args = tc.arguments if isinstance(tc.arguments, dict) else {}
-            name = tc.name
-
-            # Intervention G (Commit 2): argument canonicalization for
-            # log_verification and call_discoverable_*_tool. The format
-            # changes touch only fields where the oracle uses a fixed
-            # representation (time_verified, date_of_birth, phone_number).
-            # JSON canonicalization (sort_keys, compact separators) is
-            # applied to call_discoverable_agent_tool's `arguments` field
-            # so the literal string compares correctly against the oracle
-            # action JSON.
-            if name == "log_verification" and isinstance(args, dict):
-                fixed = canonicalize_log_verification_args(args)
-                if fixed != args:
-                    log.append({
-                        "turn": turn,
-                        "reason": "canonicalized_log_verification",
-                        "changed_keys": [k for k in fixed if fixed.get(k) != args.get(k)],
-                    })
-                    args = fixed
-                    tc = ToolCall(id=tc.id, name=tc.name, arguments=fixed)
-
-            # Intervention D: hallucination guard — if the agent tries to
-            # unlock/give a discoverable tool name that does NOT exist in
-            # the parsed catalog, drop it. The downstream tau2 orchestrator
-            # would return "Error: Unknown discoverable tool X" which
-            # confuses the LLM. Dropping + injecting a corrective note is
-            # strictly better. This only fires when the catalog is non-empty
-            # (i.e., tau2-bench has been cloned).
-            if _VALID_DISCOVERABLE_NAMES and name in ("unlock_discoverable_agent_tool", "give_discoverable_user_tool"):
-                target = (
-                    args.get("agent_tool_name")
-                    or args.get("discoverable_tool_name")
-                    or args.get("tool_name")
+            current_tc = tc
+            dropped = False
+            for intv in pre_hooks:
+                ctx = HookContext(
+                    tool_call=current_tc,
+                    assistant_msg=assistant_msg,
+                    state=self._task_state,
                 )
-                if target and target not in _VALID_DISCOVERABLE_NAMES:
-                    log.append({
-                        "turn": turn,
-                        "reason": "dropped_hallucinated_tool_name",
-                        "target": target,
-                    })
-                    drop_notes.append(
-                        f"The tool name '{target}' does not exist in the discoverable "
-                        f"tool catalog. I should consult the catalog in my system prompt "
-                        f"for the correct name, or use a base tool if appropriate."
-                    )
+                result = intv.apply(ctx)
+                if result is None:
                     continue
+                if result.log is not None:
+                    log.append(result.log)
+                if result.drop:
+                    if result.drop_note:
+                        drop_notes.append(result.drop_note)
+                    dropped = True
+                    break
+                if result.replace_with is not None:
+                    current_tc = result.replace_with
+            if not dropped:
+                kept.append(current_tc)
 
-            # Intervention A/B: deduplicate unlock/give
-            # When dropping, inject natural user-facing content that:
-            #  (a) the user simulator can respond to normally
-            #  (b) tells the LLM (via its own history on the next turn)
-            #      that the meta-tool call was already performed
-            if name == "unlock_discoverable_agent_tool":
-                target = args.get("agent_tool_name") or args.get("tool_name")
-                if target and target in unlocked_user:
-                    log.append({"turn": turn, "reason": "dropped_unlock_already_given_to_user", "target": target})
-                    drop_notes.append(
-                        f"You already have access to {target} — I provided it earlier. "
-                        f"Please call it now with the required arguments."
-                    )
-                    continue
-                if target and target in unlocked_agent:
-                    log.append({"turn": turn, "reason": "dropped_redundant_unlock", "target": target})
-                    drop_notes.append(
-                        f"I already have {target} unlocked and will proceed with the call."
-                    )
-                    continue
-            elif name == "give_discoverable_user_tool":
-                target = args.get("discoverable_tool_name") or args.get("tool_name")
-                if target and target in unlocked_agent:
-                    log.append({"turn": turn, "reason": "dropped_give_already_unlocked_for_agent", "target": target})
-                    drop_notes.append(
-                        f"I will handle {target} on your behalf since I have it unlocked."
-                    )
-                    continue
-                if target and target in unlocked_user:
-                    log.append({"turn": turn, "reason": "dropped_redundant_give", "target": target})
-                    drop_notes.append(
-                        f"You already have access to {target} — I provided it earlier. "
-                        f"Please call it now with the required arguments."
-                    )
-                    continue
-
-            # Intervention C (extended in Commit 2): JSON-encode and
-            # canonicalize the `arguments` field on call_discoverable_*_tool.
-            # τ²-bench requires `arguments` to be a JSON STRING (not a dict)
-            # AND compares it literally against the oracle. Using
-            # canonicalize_json_args produces sorted-key compact JSON that
-            # matches the oracle's serialization format consistently.
-            if name in ("call_discoverable_agent_tool", "call_discoverable_user_tool") and isinstance(args, dict):
-                inner = args.get("arguments")
-                if inner is not None:
-                    canonical = canonicalize_json_args(inner)
-                    if canonical != inner:
-                        fixed = dict(args)
-                        fixed["arguments"] = canonical
-                        tc = ToolCall(id=tc.id, name=tc.name, arguments=fixed)
-                        log.append({
-                            "turn": turn,
-                            "reason": "canonicalized_json_arguments",
-                            "target": args.get("agent_tool_name") or args.get("discoverable_tool_name") or "?",
-                        })
-
-            # Intervention H: enum pre-validation for call_discoverable_agent_tool.
-            # τ²-bench's action matcher scores the FIRST call attempt — if
-            # the LLM sends an invalid enum value (e.g., account_type="premium")
-            # the task is marked failed even if the LLM retries with a correct
-            # value later. We already detect enum constraints in the annotator
-            # (Intervention C) but don't enforce them at the gate. This closes
-            # the detect→enforce gap.
-            #
-            # compass.enum_constraints(tool) parses "one of ..." clauses from
-            # the tool's docstring and returns {param: [valid_values]}. When
-            # the LLM's proposed arguments contain an out-of-set value, we
-            # drop the call and inject a correction note listing the valid
-            # values. Domain-agnostic — works for any tool with enum docstrings.
-            if name == "call_discoverable_agent_tool" and isinstance(args, dict):
-                target_tool = args.get("agent_tool_name") or ""
-                inner_str = args.get("arguments")
-                if target_tool and isinstance(inner_str, str) and inner_str:
-                    constraints = COMPASS.enum_constraints(target_tool)
-                    # Let the banking extension inject additional constraints
-                    # not derivable from docstrings (e.g., account_class).
-                    if _BANKING_EXT is not None and hasattr(_BANKING_EXT, "extra_enum_constraints"):
-                        extra = _BANKING_EXT.extra_enum_constraints(target_tool, inner_str)
-                        if extra:
-                            constraints = {**constraints, **extra}
-                    if constraints:
-                        try:
-                            inner_kwargs = json.loads(inner_str)
-                        except (json.JSONDecodeError, TypeError):
-                            inner_kwargs = None
-                        if isinstance(inner_kwargs, dict):
-                            violations = []
-                            for param, valid in constraints.items():
-                                got = inner_kwargs.get(param)
-                                if got is not None and got not in valid:
-                                    violations.append((param, got, valid))
-                            if violations:
-                                details = "; ".join(
-                                    f"{p} must be one of {v} but got {g!r}"
-                                    for p, g, v in violations
-                                )
-                                log.append({
-                                    "turn": turn,
-                                    "reason": "blocked_enum_violation",
-                                    "target": target_tool,
-                                    "violations": [{"param": p, "got": g} for p, g, _ in violations],
-                                })
-                                drop_notes.append(
-                                    f"Blocked {target_tool}: {details}. "
-                                    f"Retry with a valid value — the action matcher scores "
-                                    f"the FIRST call attempt."
-                                )
-                                continue
-
-            # Intervention E (Commit 1): Phase-2 guard.
-            # If the agent is about to call an agent-side mutation that pairs
-            # with a still-pending user-side tool, block it. "Pairs" means:
-            # the agent gave a user-side tool whose semantic family overlaps
-            # with the agent-side tool the LLM is now invoking, AND the
-            # user-side counter says the customer hasn't called it enough
-            # times yet.
-            #
-            # The pairing table is DOMAIN-SPECIFIC — it comes from the
-            # registered extension (banking plugs in its cash-back and
-            # deposit rules). Other domains register their own extension
-            # with a `phase2_pairs` property. Empty dict when no extension.
-            #
-            # If the user has called the user-side tool at least once we let
-            # the agent-side cleanup through (the customer might really be
-            # done after one call, e.g., a single-transaction dispute).
-            # The check fires only when zero user-side calls have been
-            # observed since the give — that's the hardest signal of
-            # premature Phase-2 cleanup.
-            phase2_pairs = _BANKING_EXT.phase2_pairs if _BANKING_EXT is not None else {}
-            if name == "call_discoverable_agent_tool" and isinstance(args, dict):
-                target_tool = args.get("agent_tool_name") or ""
-                user_calls = self._task_state.get("user_calls_by_tool", {})
-                blocked = False
-                for given_tool, agent_prefixes in phase2_pairs.items():
-                    if given_tool not in unlocked_user:
-                        continue
-                    if any(target_tool.startswith(p) for p in agent_prefixes):
-                        if user_calls.get(given_tool, 0) == 0:
-                            log.append({
-                                "turn": turn,
-                                "reason": "blocked_phase2_before_user_call",
-                                "target": target_tool,
-                                "given_tool": given_tool,
-                            })
-                            drop_notes.append(
-                                f"I gave you the tool {given_tool} earlier — please call it "
-                                f"with the specific transaction details first. I will only "
-                                f"update the backend records after the customer has submitted."
-                            )
-                            blocked = True
-                            break
-                if blocked:
-                    continue
-
-            kept.append(tc)
-
-        # Intervention F (Commit 1, upgraded by Phase D): post-give
-        # tell-the-customer reminder. If a give_discoverable_user_tool was
-        # kept in this turn, append a reminder to the assistant content
-        # telling the LLM to follow up with the specific argument values
-        # the customer needs.
-        #
-        # Phase D upgrade: when we have a cached dispute_candidates list
-        # for the current user (computed from a prior
-        # get_credit_card_transactions_by_user call), the reminder lists
-        # the SPECIFIC outlier transaction_ids identified by the offline
-        # calculator. This bypasses the LLM's fragile reward-arithmetic
-        # reasoning entirely.
+        # gate_post: iterate REGISTRY.for_hook("gate_post") once per kept call.
+        # Returned annotations are appended to the assistant content after
+        # any drop-notes.
         give_notes: list[str] = []
+        post_hooks = REGISTRY.for_hook("gate_post")
         for tc in kept:
-            if tc.name != "give_discoverable_user_tool":
-                continue
-            args = tc.arguments if isinstance(tc.arguments, dict) else {}
-            target = args.get("discoverable_tool_name") or args.get("tool_name")
-            if not target:
-                continue
-            uid = self._task_state.get("current_user_id") or "<user_id>"
-
-            # Phase D: prefer the domain extension's targeted formatter
-            # (banking computes exact dispute outliers from the cached
-            # calculator state). When the formatter returns None, fall
-            # back to the generic txn-id hint or the bare reminder.
-            domain_note = None
-            if _BANKING_EXT is not None:
-                candidates = _BANKING_EXT.get_dispute_candidates(self._task_state, uid)
-                if candidates:
-                    domain_note = _BANKING_EXT.format_dispute_targets_message(
-                        target, candidates, uid
-                    )
-
-            if domain_note:
-                give_notes.append(domain_note)
-            else:
-                # Ask the extension for a domain-specific fallback (banking
-                # returns a cash-back-dispute-specific hint when the id-only
-                # txn cache is populated but the structured calculator
-                # hasn't run yet). Fall through to a generic reminder when
-                # the extension returns None or isn't registered.
-                fallback = None
-                if _BANKING_EXT is not None:
-                    fallback = _BANKING_EXT.format_give_fallback_message(
-                        target, self._task_state, uid
-                    )
-                if fallback:
-                    give_notes.append(fallback)
-                elif target:
-                    give_notes.append(
-                        f"Reminder: tell the customer the EXACT arguments to use with {target}. "
-                        f"Pull any IDs they need from a get_* tool result and include them in your "
-                        f"next message — the customer cannot guess the right values."
-                    )
+            for intv in post_hooks:
+                ctx = HookContext(
+                    tool_call=tc,
+                    assistant_msg=assistant_msg,
+                    state=self._task_state,
+                )
+                result = intv.apply(ctx)
+                if result is None:
+                    continue
+                if result.log is not None:
+                    log.append(result.log)
+                if result.annotation:
+                    give_notes.append(result.annotation)
 
         # If we dropped everything, we MUST return visible content so the
         # LLM sees what happened and doesn't immediately retry the same call.
