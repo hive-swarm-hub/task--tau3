@@ -587,7 +587,9 @@ def parse_response(choice):
 # ── AGENT ─────────────────────────────────────────────────────────────────────
 
 MAX_RETRIES = 3
-LOOP_BREAK_LIMIT = 5  # Force text response after N consecutive tool calls to break search loops
+_DEFAULT_LOOP_BREAK = 5   # BM25: few consecutive tool calls expected
+_TERMINAL_LOOP_BREAK = 20 # terminal_use: shell exploration needs many sequential calls
+LOOP_BREAK_LIMIT = _TERMINAL_LOOP_BREAK if RETRIEVAL_VARIANT == "terminal_use" else _DEFAULT_LOOP_BREAK
 PHASE2_ESCAPE_TURNS = 6  # After this many turns since give_discoverable_user_tool, unblock Phase-2 guard
 
 
