@@ -18,3 +18,6 @@ eval_banking_knowledge/
 tau2-bench/
 run_*.log
 eval_runs/
+
+# tau2-bench embedding cache (semantic retrieval)
+data/.embeddings_cache/
