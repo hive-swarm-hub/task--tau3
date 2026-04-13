@@ -4,7 +4,10 @@ Interventions are first-class, registered, discoverable objects. Previously the
 banking agent had 9 interventions embedded inline inside ``_gate_tool_calls``
 and ``annotate_banking`` — new swarm agents had to grep a 1200-line file to
 find them. This module provides the hook-dispatch infrastructure; the
-individual interventions themselves live in ``interventions_banking.py``.
+individual plug-ins live in sibling modules inside this package — e.g.
+``interventions.banking`` (A-H), ``interventions.prefer_discoverable_reads`` (J),
+``interventions.verify_before_mutate`` (K). See ``docs/interventions_inventory.md``
+for the per-intervention reference.
 
 Typical usage:
 
@@ -170,6 +173,6 @@ class InterventionRegistry:
 
 
 # Module-level singleton. Import and call ``REGISTRY.register(...)`` from
-# your interventions module. The banking agent's interventions are wired in
-# ``interventions_banking.py`` (imported by agent.py at startup).
+# your interventions plug-in. Banking's interventions are wired in
+# ``interventions.banking`` (imported by agent.py at startup).
 REGISTRY = InterventionRegistry()

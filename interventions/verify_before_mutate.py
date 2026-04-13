@@ -44,11 +44,10 @@ interventions.py):
       "Verification / unlock (P1) → gate_pre: block mutations before
       log_verification lands").
 
-  G6. Registration wiring — program.md says add
-      ``import interventions_verify_before_mutate  # noqa`` to
-      agent.py's imports. I am forbidden from modifying agent.py, so
-      this registration is currently a no-op at runtime. The test
-      loads this module directly.
+  G6. Registration wiring — to activate this plug-in at agent startup,
+      add ``from interventions import verify_before_mutate as _  # noqa``
+      to agent.py's imports. Until then it only loads when pytest or
+      ``scripts/list_interventions.py`` imports it directly.
 -----------------------------------------------------------------
 """
 from __future__ import annotations

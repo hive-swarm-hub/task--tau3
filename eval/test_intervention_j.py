@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import interventions_prefer_discoverable_reads as modj  # noqa: E402
+from interventions import prefer_discoverable_reads as modj  # noqa: E402
 from interventions import HookContext  # noqa: E402
 
 

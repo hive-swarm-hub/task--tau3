@@ -27,14 +27,18 @@ def _load_registry():
             file=sys.stderr,
         )
         sys.exit(1)
-    # Auto-import all interventions_*.py sibling modules so their
-    # registration side effects populate REGISTRY before we dump it.
+    # Auto-import all plug-in modules inside the `interventions/` package so
+    # their registration side effects populate REGISTRY before we dump it.
     # Without this the CLI would show an empty registry unless the caller
-    # pre-imported agent.py (which imports the banking interventions).
+    # pre-imported agent.py (which imports the banking plug-in).
     import glob
     import importlib
-    for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "interventions_*.py"))):
-        module_name = os.path.splitext(os.path.basename(path))[0]
+    pkg_dir = os.path.join(_REPO_ROOT, "interventions")
+    for path in sorted(glob.glob(os.path.join(pkg_dir, "*.py"))):
+        fname = os.path.basename(path)
+        if fname.startswith("_"):
+            continue  # skip __init__.py and private modules
+        module_name = f"interventions.{os.path.splitext(fname)[0]}"
         try:
             importlib.import_module(module_name)
         except Exception as e:
