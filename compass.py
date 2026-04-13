@@ -693,23 +693,24 @@ class ToolCompass:
 
 
 def canonicalize_json_args(value) -> str:
-    """Canonical JSON string for tool arguments, sorted + compact.
+    """Canonical JSON string for tool arguments, sorted + standard spacing.
 
     Used by the gate to convert dict-shaped `arguments` on
     call_discoverable_agent_tool / call_discoverable_user_tool into the
     exact form τ²-bench compares against the oracle's literal string.
+
+    BUG FIX: compact separators (",",":") → standard json.dumps() spacing.
+    The oracle compares literal strings; compact was a guaranteed mismatch.
     """
     if isinstance(value, str):
-        # Already a string. Try to round-trip through json to canonicalize
-        # the spacing/key order. If it doesn't parse, return as-is.
         try:
             parsed = json.loads(value)
-            return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+            return json.dumps(parsed, sort_keys=True)
         except (json.JSONDecodeError, ValueError):
             return value
     if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return json.dumps(value, sort_keys=True)
+    return json.dumps(value, sort_keys=True)
 
 
 # ── scenario playbook framework (generic) ───────────────────────────────────

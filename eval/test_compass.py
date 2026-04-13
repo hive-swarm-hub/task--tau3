@@ -379,15 +379,15 @@ def test_canonicalize_lv_idempotent():
 
 
 def test_canonicalize_json_args_dict():
-    section("canonicalize_json_args — dict → sorted compact string")
+    section("canonicalize_json_args — dict → sorted standard-spacing string")
     s = canonicalize_json_args({"b": 2, "a": 1, "c": [3, 2, 1]})
-    assert_eq(s, '{"a":1,"b":2,"c":[3,2,1]}', "sorted keys + compact separators")
+    assert_eq(s, '{"a": 1, "b": 2, "c": [3, 2, 1]}', "sorted keys + standard separators (oracle format)")
 
 
 def test_canonicalize_json_args_string_canonicalizes_spacing():
     section("canonicalize_json_args — string with stray whitespace canonicalized")
     s = canonicalize_json_args('{"b":  2, "a":  1}')
-    assert_eq(s, '{"a":1,"b":2}', "whitespace stripped, keys sorted")
+    assert_eq(s, '{"a": 1, "b": 2}', "whitespace normalized, keys sorted (oracle format)")
 
 
 def test_canonicalize_json_args_unparseable_string_passthrough():

@@ -109,19 +109,49 @@ TERMINAL_PROMPT_SECTION = """
 ## Terminal-mode retrieval (RETRIEVAL_VARIANT=terminal_use)
 
 You have a `shell` tool instead of `KB_search`. The banking KB is mounted as
-JSON files on disk — run `ls` first to discover the mount path (typically
-`./documents/` or similar). Use `grep -rli <keyword> .` from the KB root to
-find relevant docs, then `cat <path>` to read one. Doc filenames follow
-`doc_<category>_<slug>_NNN.json`.
+JSON/Markdown files on disk. Follow this exact workflow:
 
-Keep each query focused: ONE grep for keywords (product name, procedure name,
-symptom verbatim), then `cat` the one or two most promising hits. Do not
-chain many greps speculatively — that burns turns.
+### Step 1 — Orient (ALWAYS do this first)
+```
+ls -la
+```
+Discover the KB mount path (typically `./documents/` or `./`). Note the doc
+filename pattern: `doc_<category>_<slug>_NNN.md` (or `.json`).
 
-Every rule in the BASE INSTRUCTIONS still applies: search-first discipline,
-verification call only ONCE, exact enum values, correct discoverable variant,
-unlock-vs-give routing, minimalism (extra calls fail db_match). Replace every
-"KB_search" reference in those rules with "shell grep/cat over KB docs".
+### Step 2 — Search with content (NEVER use grep -l)
+```
+grep -Rin "<keyword>" doc_<category>_* | head -n 50
+```
+CRITICAL rules:
+- Use `-Rin` (recursive, case-insensitive, line-numbers) so you see matching
+  CONTENT, not just filenames. **NEVER use `-l`** — you need the excerpts to
+  spot discoverable tool names like `submit_cash_back_dispute_0589`.
+- **ALWAYS pipe to `| head -n 50`** to prevent output explosion.
+- Target a doc category prefix when possible: `doc_bank_accounts_*`,
+  `doc_credit_cards_*`, `doc_checking_accounts_*`, `doc_savings_accounts_*`,
+  `doc_debit_cards_*`. This is MUCH faster than searching all docs.
+- If the first search returns nothing, broaden with alternation:
+  `grep -Rin "term1\\|term2\\|term3" doc_<category>_* | head -n 50`
+
+### Step 3 — Read the best hit (partial, not full)
+```
+sed -n '1,200p' <matched_file>
+```
+Use `sed -n 'START,ENDp'` for partial reads — most docs are 50-300 lines and
+you only need the relevant section. Use `cat` only for short docs (<100 lines).
+
+### Step 4 — Act on what you found
+Unlock/call the discoverable tools mentioned in the doc, following all BASE
+INSTRUCTIONS rules (verification, enum constraints, unlock-vs-give routing).
+
+### Step 5 — Repeat if needed
+If you need more info, go back to Step 2 with different keywords. Budget
+~30-50 shell commands per task. Systematic broadening is fine; aimless
+repetition is not.
+
+### KB_search replacement
+Wherever BASE INSTRUCTIONS say "KB_search", use shell grep/cat instead.
+All other rules (verification once, exact enums, minimalism) still apply.
 """.strip()
 
 BASE_INSTRUCTIONS = """
@@ -227,6 +257,21 @@ Simple email-update requests ("I want to change my email from X to Y" where X ma
 - When the user confirms, proceed immediately — do not ask for confirmation twice.
 - Do EXACTLY what the task requires — no more, no less. Extra mutations fail db_match.
 - Keep user-facing messages concise and include concrete data the customer needs.
+
+## Valid `reason` values for `transfer_to_human_agents`
+
+The `reason` parameter is a closed set — the action matcher checks for exact string match.
+Pick the reason that best describes WHY you are transferring:
+
+- `"account_ownership_dispute"` — customer's claimed identity info contradicts the DB (email, DOB, address mismatch)
+- `"fraud_or_security_concern"` — customer reports unauthorized activity, stolen card, suspicious transactions
+- `"customer_demands_after_unavailable_offer_refusal"` — customer insists on redeeming an offer/service you cannot provide, and demands a human after you refuse
+- `"kb_search_unsuccessful_customer_requests_transfer"` — you searched the KB but could not find relevant information, and the customer asks to be transferred
+- `"unconfirmed_external_communication"` — customer references an external letter, email, or communication you cannot verify in the system
+
+Do NOT invent other reason strings. If the scenario doesn't clearly match one of these, use the closest one.
+
+For the `summary` parameter: keep it empty (`""`) unless the scenario specifically requires you to describe what happened. When in doubt, use `""`.
 """.strip()
 
 SYSTEM_TEMPLATE = """
@@ -543,6 +588,7 @@ def parse_response(choice):
 
 MAX_RETRIES = 3
 LOOP_BREAK_LIMIT = 5  # Force text response after N consecutive tool calls to break search loops
+PHASE2_ESCAPE_TURNS = 6  # After this many turns since give_discoverable_user_tool, unblock Phase-2 guard
 
 
 class BankingAgentState:
@@ -620,6 +666,20 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
         # navigate the mounted KB via ls/grep/cat without rewriting every
         # KB_search reference above.
         if getattr(self, "_retrieval_variant", "bm25") == "terminal_use":
+            # Rewrite KB_search references so the agent doesn't try to call
+            # a tool that doesn't exist in terminal mode.
+            instructions = instructions.replace(
+                "you MUST call `KB_search`",
+                "you MUST search the KB via the shell tool (grep -Rin + cat)",
+            )
+            instructions = instructions.replace(
+                "KB_search for the specific procedure",
+                "search the KB via shell (grep -Rin) for the specific procedure",
+            )
+            instructions = instructions.replace(
+                "`KB_search` at least once",
+                "the shell tool (grep -Rin) at least once",
+            )
             instructions = instructions + "\n\n" + TERMINAL_PROMPT_SECTION
         return SYSTEM_TEMPLATE.format(
             instructions=instructions,
@@ -720,6 +780,7 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                     target = args.get("discoverable_tool_name") or args.get("tool_name")
                     if target:
                         self._task_state["unlocked_for_user"].add(target)
+                        self._task_state.setdefault("give_turn", {})[target] = self._task_state["turn_count"]
                 elif tc.name in ("KB_search", "kb_search", "search_knowledge_base", "shell"):
                     # Terminal-mode `shell` calls count as retrieval too so
                     # failure analyzers (extract_traces) keep working under

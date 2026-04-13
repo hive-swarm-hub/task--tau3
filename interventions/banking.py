@@ -282,6 +282,24 @@ def _apply_E_phase2_guard(ctx: HookContext) -> Optional[HookResult]:
             continue
         if not any(target_tool.startswith(p) for p in agent_prefixes):
             continue
+        # Escape hatch: if we gave the tool more than PHASE2_ESCAPE_TURNS
+        # ago and the guard is still blocking, let it through. The agent
+        # can't see the customer's tool result (arrives as UserMessage),
+        # so user_calls stays at 0 forever → infinite loop without this.
+        from agent import PHASE2_ESCAPE_TURNS
+        give_turns = ctx.state.get("give_turn", {})
+        gave_at = give_turns.get(given_tool, ctx.state.get("turn_count", 0))
+        turn = ctx.state.get("turn_count", 0)
+        if turn - gave_at > PHASE2_ESCAPE_TURNS:
+            return HookResult(
+                log={
+                    "turn": turn,
+                    "reason": "phase2_escape_hatch",
+                    "target": target_tool,
+                    "given_tool": given_tool,
+                    "turns_since_give": turn - gave_at,
+                },
+            )
         if user_calls.get(given_tool, 0) == 0:
             return HookResult(
                 drop=True,
@@ -452,6 +470,61 @@ REGISTRY.register(Intervention(
         "(using banking's offline dispute calculator when available)."
     ),
     apply=_apply_F_post_give_reminder,
+))
+
+
+# ── Intervention J (brian2): transfer_to_human_agents reason validation ──────
+
+_VALID_TRANSFER_REASONS = frozenset({
+    "account_ownership_dispute",
+    "fraud_or_security_concern",
+    "customer_demands_after_unavailable_offer_refusal",
+    "kb_search_unsuccessful_customer_requests_transfer",
+    "unconfirmed_external_communication",
+})
+
+
+def _apply_J_transfer_reason_validation(ctx: HookContext) -> Optional[HookResult]:
+    """J — drop transfer_to_human_agents when reason is not in the valid set."""
+    tc = ctx.tool_call
+    if tc.name != "transfer_to_human_agents":
+        return None
+    args = tc.arguments if isinstance(tc.arguments, dict) else {}
+    if not isinstance(args, dict):
+        return None
+    reason = args.get("reason", "")
+    if not isinstance(reason, str) or not reason:
+        return None
+    if reason in _VALID_TRANSFER_REASONS:
+        return None
+    valid_str = ", ".join(repr(r) for r in sorted(_VALID_TRANSFER_REASONS))
+    return HookResult(
+        drop=True,
+        drop_note=(
+            f"I tried to transfer with reason={reason!r} but that is not a valid "
+            f"transfer reason. Valid values are: [{valid_str}]. Pick the one that "
+            f"best describes this scenario and retry."
+        ),
+        log={
+            "turn": ctx.state.get("turn_count", 0),
+            "reason": "blocked_invalid_transfer_reason",
+            "got": reason,
+            "valid": sorted(_VALID_TRANSFER_REASONS),
+        },
+    )
+
+
+REGISTRY.register(Intervention(
+    id="J",
+    name="transfer-reason-validation",
+    hook="gate_pre",
+    target_cluster="escalation",
+    author="brian2",
+    description=(
+        "Drop transfer_to_human_agents when the reason string is not in the "
+        "5-value valid set mined from task definitions. Converts task_008/012."
+    ),
+    apply=_apply_J_transfer_reason_validation,
 ))
 
 
