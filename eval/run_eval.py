@@ -2,6 +2,10 @@
 
 import sys
 import os
+import json
+import subprocess
+from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,6 +18,156 @@ from tau2.run import run_domain, get_tasks
 # τ²-bench v1.0.0: RunConfig is now a Union type; use TextRunConfig for text/half-duplex
 from tau2.data_model.simulation import TextRunConfig
 from tau2.metrics.agent_metrics import compute_metrics
+
+# Repo root — used for writing the local snapshot and discovering the tau2
+# results directory alongside it.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# ── Config-snapshot helpers ─────────────────────────────────────────────────
+#
+# Every eval run writes a JSON blob to `eval_runs/last_config.json` (repo-local)
+# AND to `{save_dir}/config_snapshot.json` (alongside tau2's results.json) so
+# future agents can see the EXACT command that produced any past run — git
+# SHA, env vars, intervention stack, task list. See `scripts/reproduce.py` for
+# the companion tool that reconstructs the shell command from a snapshot.
+#
+# All snapshotting is wrapped in try/except — observability never breaks eval.
+
+
+def _git_sha_or_dirty() -> str:
+    """Return the current HEAD SHA, appending '-dirty' if the worktree isn't clean."""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            cwd=_REPO_ROOT,
+        ).decode().strip()
+        # `git diff --quiet HEAD` exits 0 if tree matches HEAD, nonzero if dirty.
+        dirty = subprocess.call(
+            ["git", "diff", "--quiet", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            cwd=_REPO_ROOT,
+        ) != 0
+        return f"{sha}{'-dirty' if dirty else ''}"
+    except Exception:
+        return "unknown"
+
+
+def _git_current_branch_or_detached() -> str:
+    """Return the current branch name, or 'HEAD' if detached, or 'unknown' on failure."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            cwd=_REPO_ROOT,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def _snapshot_interventions() -> list[dict]:
+    """Snapshot registered interventions with id/name/hook/status/author.
+
+    Returns [] if the registry isn't importable yet (e.g. framework not built).
+    """
+    try:
+        from interventions import REGISTRY
+        # Ensure plug-ins have loaded by importing the canonical banking module.
+        # agent.py imports this at startup anyway, but we're defensive here.
+        try:
+            from interventions import banking as _  # noqa: F401
+        except Exception:
+            pass
+        return [
+            {
+                "id": i.id,
+                "name": i.name,
+                "hook": i.hook,
+                "status": i.status,
+                "author": i.author,
+            }
+            for i in REGISTRY.list(include_disabled=True)
+        ]
+    except Exception:
+        return []
+
+
+def _tau2_version_if_discoverable() -> str:
+    """Return the installed tau2 package version, or 'unknown'."""
+    try:
+        import tau2
+        return getattr(tau2, "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _discover_save_dir() -> str:
+    """Best-effort: find the directory where tau2 will save results.json.
+
+    Mirrors the path-walking logic in eval/eval.sh — walks up from the tau2
+    package dir to find `data/simulations`, then appends `eval_{DOMAIN}`.
+    Falls back to the local tau2-bench submodule path if discovery fails.
+    """
+    try:
+        import tau2
+        d = Path(tau2.__file__).parent
+        for _ in range(6):
+            cand = d / "data" / "simulations"
+            if cand.is_dir():
+                return str(cand / f"eval_{DOMAIN}")
+            if d.parent == d:
+                break
+            d = d.parent
+    except Exception:
+        pass
+    return str(Path(_REPO_ROOT) / "tau2-bench" / "data" / "simulations" / f"eval_{DOMAIN}")
+
+
+def _write_snapshot(snapshot: dict) -> None:
+    """Write snapshot to eval_runs/last_config.json AND {save_dir}/config_snapshot.json.
+
+    NEVER raises — observability is nice-to-have.
+    """
+    # 1) repo-local, gitignored — the canonical "last run" pointer
+    try:
+        local_dir = Path(_REPO_ROOT) / "eval_runs"
+        local_dir.mkdir(parents=True, exist_ok=True)
+        with open(local_dir / "last_config.json", "w") as f:
+            json.dump(snapshot, f, indent=2, default=str)
+    except Exception as e:
+        print(f"[eval] warning: could not write eval_runs/last_config.json: {e}", file=sys.stderr)
+    # 2) alongside tau2's results.json — survives archival of a run dir
+    try:
+        save_dir = Path(_discover_save_dir())
+        save_dir.mkdir(parents=True, exist_ok=True)
+        with open(save_dir / "config_snapshot.json", "w") as f:
+            json.dump(snapshot, f, indent=2, default=str)
+    except Exception as e:
+        print(f"[eval] warning: could not write config_snapshot.json to save_dir: {e}", file=sys.stderr)
+
+
+def _print_snapshot_summary(snapshot: dict) -> None:
+    """One-line summary to stderr at the start of the run."""
+    try:
+        sha_raw = snapshot.get("git_sha", "unknown")
+        sha_short = sha_raw[:7] + ("-dirty" if sha_raw.endswith("-dirty") else "")
+        branch = snapshot.get("git_branch", "unknown")
+        env = snapshot.get("env", {}) or {}
+        mode = env.get("RETRIEVAL_VARIANT", "bm25")
+        lite = env.get("EVAL_LITE", "0") == "1"
+        mode_str = f"{mode}{' (lite)' if lite else ''}"
+        interventions = snapshot.get("interventions", []) or []
+        n_active = sum(1 for i in interventions if i.get("status") == "active")
+        n_experimental = sum(1 for i in interventions if i.get("status") == "experimental")
+        print(
+            f"[eval] config snapshot: SHA={sha_short}, branch={branch}, "
+            f"mode={mode_str}, interventions: {n_active} active + {n_experimental} experimental",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
 
 # Register our custom agent factory (tau2 v1.0.0 factory-function API)
 registry.register_agent_factory(create_custom_agent, "custom")
@@ -155,6 +309,41 @@ def run_all():
         log_level="WARNING",
         max_concurrency=MAX_CONCURRENCY,
     )
+
+    # ── Snapshot config BEFORE run_domain fires so a crash still leaves
+    # eval_runs/last_config.json behind for post-mortem reproduction.
+    try:
+        snapshot = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "git_sha": _git_sha_or_dirty(),
+            "git_branch": _git_current_branch_or_detached(),
+            "env": {
+                "RETRIEVAL_VARIANT": os.environ.get("RETRIEVAL_VARIANT", "bm25"),
+                "SOLVER_MODEL": os.environ.get("SOLVER_MODEL", "gpt-4.1-mini"),
+                "USER_MODEL": os.environ.get("USER_MODEL", "gpt-4.1-2025-04-14"),
+                "EVAL_CONCURRENCY": os.environ.get("EVAL_CONCURRENCY", "8"),
+                "EVAL_LITE": os.environ.get("EVAL_LITE", "0"),
+                "SAMPLE_FRAC": os.environ.get("SAMPLE_FRAC", "1.0"),
+                "DISABLED_INTERVENTIONS": os.environ.get("DISABLED_INTERVENTIONS", ""),
+                "ENABLE_EXPERIMENTAL": os.environ.get("ENABLE_EXPERIMENTAL", "0"),
+            },
+            "config": {
+                "domain": DOMAIN,
+                "split": SPLIT,
+                "num_trials": NUM_TRIALS,
+                "max_concurrency": MAX_CONCURRENCY,
+                "task_ids": list(task_ids),
+                "n_tasks": len(task_ids),
+            },
+            "interventions": _snapshot_interventions(),
+            "python_version": sys.version.split()[0],
+            "tau2_version": _tau2_version_if_discoverable(),
+        }
+        _write_snapshot(snapshot)
+        _print_snapshot_summary(snapshot)
+    except Exception as e:  # pragma: no cover — observability MUST not fail eval
+        print(f"[eval] warning: config snapshot failed: {e}", file=sys.stderr)
+
     results = run_domain(config)
     metrics = compute_metrics(results)
 

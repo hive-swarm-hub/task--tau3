@@ -173,6 +173,11 @@ def main() -> int:
         print(f"Failed to enumerate registry: {exc}", file=sys.stderr)
         return 1
 
+    # Pull env-override info exposed by the registry (populated lazily on the
+    # first for_hook()/list() call, which we just made above).
+    env_disabled = list(getattr(registry, "_env_disabled_ids", []) or [])
+    env_enabled_exp = list(getattr(registry, "_env_enabled_experimental_ids", []) or [])
+
     if not items:
         print("(registry is empty)", file=sys.stderr)
 
@@ -184,8 +189,14 @@ def main() -> int:
         json.dump([_to_dict(it) for it in items], sys.stdout, indent=2, default=str)
         sys.stdout.write("\n")
     elif args.verbose:
+        if env_disabled or env_enabled_exp:
+            print(f"[env overrides: disabled={env_disabled} enabled_experimental={env_enabled_exp}]")
+            print()
         _print_verbose(items)
     else:
+        if env_disabled or env_enabled_exp:
+            print(f"[env overrides: disabled={env_disabled} enabled_experimental={env_enabled_exp}]")
+            print()
         _print_table(items)
     return 0
 
