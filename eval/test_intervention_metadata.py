@@ -33,7 +33,7 @@ from interventions import REGISTRY, Intervention  # noqa: E402
 # import errors, only the live-registry tests fail — the rule unit tests
 # (which use synthetic Interventions) still run.
 try:  # pragma: no cover — guarded import
-    import interventions_banking  # noqa: F401,E402  (side-effect: registers)
+    from interventions import banking as _interventions_banking  # noqa: F401,E402  (side-effect: registers)
 except Exception as _exc:  # pragma: no cover
     _IMPORT_ERR = _exc
 else:

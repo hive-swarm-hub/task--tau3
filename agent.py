@@ -62,10 +62,10 @@ from compass import (
 )
 
 # Intervention registry — wire up the 9 banking interventions at import time.
-# ``interventions_banking`` registers each one into REGISTRY; the gate below
+# ``interventions.banking`` registers each one into REGISTRY; the gate below
 # iterates REGISTRY.for_hook(...) instead of the old inline elif-cascade.
 from interventions import REGISTRY, HookContext  # noqa: F401
-import interventions_banking  # noqa: F401  (side effect: registrations)
+from interventions import banking as _interventions_banking  # noqa: F401  (side effect: registrations)
 
 # Banking-specific hooks live on an extension plugged into COMPASS. If the
 # banking extension is not registered (e.g., running this scaffold on a
