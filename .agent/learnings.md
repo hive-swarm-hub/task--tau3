@@ -91,7 +91,11 @@ Note: P4 fixes are COUPLED — fixing loop detection may regress under-action, f
 
 ## Cross-priority insights
 
-*(patterns that span multiple classes, surprising interactions, or reveal new failure modes not in the taxonomy)*
+- [CROSS] Terminal_use retrieval is CONCLUSIVELY WORSE than BM25 on gpt-4.1-mini: 3 attempts (v1 grep-rli, v1.5 grep-rn+rewrite, v2 trajectory-informed from GPT-5.2 patterns) all scored 3-5/20 lite vs BM25's 7-9/20. Canary 1/4 across all. The 2x retrieval boost requires gpt-4.1+ to unlock. (brian2, 3 experiments + 8-model trajectory analysis from tau3_research repo)
+- [CROSS] The enum-surfacing pattern generalizes: tool docstrings are incomplete for account_class, transfer reason, and likely others. Mining valid values from KB doc filenames or task definitions → prompt + gate validation is the highest-leverage repeatable pattern. Our Intervention J outperforms GPT-5.2 on task_008 (even the top model guesses wrong reason strings). (brian2 Interventions H/I/J)
+- [CROSS] Variance on gpt-4.1-mini is ±2 tasks per full eval. 20 distinct tasks have passed at least once across brian2 runs, but max single-run is 11/97. Multi-trial averaging essential. (all agents)
+- [CROSS] BM25 ceiling = embedding ceiling ≈ 11/97 (11.3%). Matches GPT-5.2 no-reasoning at 12.4%. Both confirmed independently by brian2 empirical runs + 8-model trajectory analysis.
+- [CROSS] apply_for_credit_card is customer-side (5+ tasks). Agent can't force it. (brian2 trace analysis)
 
 ---
 
