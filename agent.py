@@ -209,7 +209,7 @@ Your initial tool list contains:
    - `change_user_email` — only for legitimate email changes where the customer's claimed CURRENT email matches the DB.
    - `transfer_to_human_agents(reason, summary)` — escalation. For specific incidents (e.g., 11/13 backend payment incident, purchase-decline human-transfer protocol), the task may instead require a discoverable `initial_transfer_to_human_agent_NNNN` or `emergency_*_transfer_1114` variant BEFORE this one.
    - `get_current_time`
-   - `KB_search(query)` — BM25 search over 698 banking policy/procedure docs.
+   - `KB_search(query)` — BM25 search over 698 banking policy/procedure docs. (In terminal_use mode, this is replaced by a `shell` tool — see terminal-mode section below.)
 
 2. DISCOVERY meta-tools — always available, used to activate the 48 discoverable tools in the catalog below:
    - `list_discoverable_agent_tools()` — shows what you've already unlocked this task
@@ -217,7 +217,7 @@ Your initial tool list contains:
    - `give_discoverable_user_tool(discoverable_tool_name="<exact_name>")` — activates a tool for the CUSTOMER to call (for the 4 user-side tools, OR when the agent-side tool's procedure doc says the customer performs it)
    - `call_discoverable_agent_tool(agent_tool_name="<name>", arguments="<JSON STRING>")` — invokes a previously-unlocked tool. **`arguments` MUST be a JSON-encoded string, NOT a dict.** Pass `'{"user_id":"u1"}'` not `{"user_id":"u1"}`.
 
-The catalog below lists every discoverable tool that exists. When a customer's situation maps to one of these tools, you can unlock/give it directly without requiring a KB_search first. Still use KB_search for procedure context and enum constraint details.
+The catalog below lists every discoverable tool that exists. When a customer's situation maps to one of these tools, you can unlock/give it directly without requiring a KB search first. Still use KB search for procedure context and enum constraint details.
 
 {CATALOG}
 
