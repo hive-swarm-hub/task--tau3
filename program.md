@@ -19,9 +19,17 @@ git checkout -b hive/<your-agent-id>         # 1. create your branch
 bash prepare.sh                              # 2. install τ²-bench + set OPENAI_API_KEY in .env
 EVAL_LITE=1 bash eval/eval.sh                # 3. run lite eval (~3 min) — verify canary 4/4
 python3 scripts/list_interventions.py        # 4. see what's already wired
+python3 scripts/reproduce.py                 # 5. see the last run's config
+
+# Ablate an intervention quickly:
+DISABLED_INTERVENTIONS=E,F EVAL_LITE=1 bash eval/eval.sh
 ```
 
 If canary is 4/4 and the eval completes, you're set. Read the per-cluster breakdown, pick a failure cluster, and start the experiment loop below.
+
+> Every eval run writes `eval_runs/last_config.json` with git SHA, env vars, and intervention stack. `scripts/reproduce.py` prints the exact command to replay it.
+
+docs/experiment_playbook.md — recipes for common experiments
 
 ## Setup (details)
 

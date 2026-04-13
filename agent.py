@@ -94,6 +94,36 @@ def _parse_discoverable_catalog(source_path: Optional[Path] = None) -> dict:
 
 # ── PROMPTS ──────────────────────────────────────────────────────────────────
 
+# Retrieval mode detection (BM25 vs terminal_use)
+# -----------------------------------------------
+# Read once at import from RETRIEVAL_VARIANT env var and plumbed into the
+# agent via _task_state["retrieval_variant"] so interventions can branch.
+# When mode == "terminal_use", tau2-bench replaces the KB_search tool with a
+# `shell` tool running in an Anthropic sandbox-runtime; system_prompt appends
+# TERMINAL_PROMPT_SECTION so the agent knows how to browse the KB on disk.
+# All existing BASE_INSTRUCTIONS rules (enum constraints, verification,
+# unlock/give protocol, scoring minimalism) still apply in both modes.
+RETRIEVAL_VARIANT = os.environ.get("RETRIEVAL_VARIANT", "bm25")
+
+TERMINAL_PROMPT_SECTION = """
+## Terminal-mode retrieval (RETRIEVAL_VARIANT=terminal_use)
+
+You have a `shell` tool instead of `KB_search`. The banking KB is mounted as
+JSON files on disk — run `ls` first to discover the mount path (typically
+`./documents/` or similar). Use `grep -rli <keyword> .` from the KB root to
+find relevant docs, then `cat <path>` to read one. Doc filenames follow
+`doc_<category>_<slug>_NNN.json`.
+
+Keep each query focused: ONE grep for keywords (product name, procedure name,
+symptom verbatim), then `cat` the one or two most promising hits. Do not
+chain many greps speculatively — that burns turns.
+
+Every rule in the BASE INSTRUCTIONS still applies: search-first discipline,
+verification call only ONCE, exact enum values, correct discoverable variant,
+unlock-vs-give routing, minimalism (extra calls fail db_match). Replace every
+"KB_search" reference in those rules with "shell grep/cat over KB docs".
+""".strip()
+
 BASE_INSTRUCTIONS = """
 You are a customer service agent for a bank. You MUST follow the <policy> exactly. The policy is your sole source of truth — never invent rules, procedures, or information not in the policy or provided by the user.
 
@@ -567,6 +597,10 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
         self.llm = llm or os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
         self.llm_args = dict(llm_args or {})
         self._consecutive_tool_calls = 0
+        # Retrieval variant is resolved once at agent construction so
+        # system_prompt (a property) and _reset_task_state stay consistent
+        # across the agent's lifetime.
+        self._retrieval_variant = RETRIEVAL_VARIANT
         self._task_state: dict = {}
         self._reset_task_state()
 
@@ -581,6 +615,12 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             acct_section = _BANKING_EXT.render_account_class_prompt_section()
             if acct_section:
                 instructions = instructions + "\n\n" + acct_section
+        # Under terminal_use retrieval, tau2-bench swaps KB_search for a
+        # `shell` tool. Append a short section telling the agent how to
+        # navigate the mounted KB via ls/grep/cat without rewriting every
+        # KB_search reference above.
+        if getattr(self, "_retrieval_variant", "bm25") == "terminal_use":
+            instructions = instructions + "\n\n" + TERMINAL_PROMPT_SECTION
         return SYSTEM_TEMPLATE.format(
             instructions=instructions,
             policy=self.domain_policy,
@@ -604,8 +644,12 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             "verified_user_ids": set(),     # populated when log_verification succeeds
             "unlocked_for_agent": set(),    # names unlocked via unlock_discoverable_agent_tool
             "unlocked_for_user": set(),     # names given via give_discoverable_user_tool
-            "kb_search_count": 0,           # how many KB_search calls have been made
+            "kb_search_count": 0,           # how many KB_search (or shell) retrieval calls
             "gate_interventions": [],       # log of _gate_tool_calls rewrites (for debugging)
+            # Retrieval mode — "bm25" (default KB_search) or "terminal_use"
+            # (shell tool over KB docs on disk). Interventions may branch on
+            # this field; annotator behavior stays agnostic.
+            "retrieval_variant": getattr(self, "_retrieval_variant", RETRIEVAL_VARIANT),
             # Commit 1 additions: user-side compliance tracking
             "user_calls_by_tool": {},       # {discoverable_tool_name: count} — populated when
                                             # we observe a tool result for a user-side execution
@@ -676,7 +720,10 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                     target = args.get("discoverable_tool_name") or args.get("tool_name")
                     if target:
                         self._task_state["unlocked_for_user"].add(target)
-                elif tc.name in ("KB_search", "kb_search", "search_knowledge_base"):
+                elif tc.name in ("KB_search", "kb_search", "search_knowledge_base", "shell"):
+                    # Terminal-mode `shell` calls count as retrieval too so
+                    # failure analyzers (extract_traces) keep working under
+                    # both retrieval variants. Annotator behavior is unchanged.
                     self._task_state["kb_search_count"] += 1
                 # Domain-specific identity tracking: the extension decides
                 # which tool names reveal a user_id. Banking uses both

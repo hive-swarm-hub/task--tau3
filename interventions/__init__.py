@@ -26,6 +26,8 @@ by importing REGISTRY and calling ``REGISTRY.register(Intervention(...))``.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
 
@@ -107,6 +109,12 @@ class InterventionRegistry:
     def __init__(self) -> None:
         self._by_id: dict[str, Intervention] = {}
         self._order: list[str] = []
+        # Env-override tracking — applied lazily on the first for_hook()/list()
+        # call so plug-in modules have had a chance to register. See
+        # ``_apply_env_overrides`` below.
+        self._env_applied: bool = False
+        self._env_disabled_ids: list[str] = []
+        self._env_enabled_experimental_ids: list[str] = []
 
     def register(self, intervention: Intervention, *, force: bool = False) -> None:
         """Register an intervention. Raises ValueError on duplicate id.
@@ -139,6 +147,7 @@ class InterventionRegistry:
 
     def for_hook(self, hook: HookType) -> list[Intervention]:
         """Return active interventions for ``hook`` in registration order."""
+        self._ensure_env_overrides_applied()
         return [
             self._by_id[i]
             for i in self._order
@@ -148,6 +157,7 @@ class InterventionRegistry:
 
     def list(self, *, include_disabled: bool = False) -> list[Intervention]:
         """Return all registered interventions in registration order."""
+        self._ensure_env_overrides_applied()
         if include_disabled:
             return [self._by_id[i] for i in self._order]
         return [
@@ -170,6 +180,66 @@ class InterventionRegistry:
         intv = self._by_id[id]
         # dataclass instance; we mutate in-place for simplicity
         object.__setattr__(intv, "status", status)  # works on non-frozen dataclass too
+
+    def _ensure_env_overrides_applied(self) -> None:
+        """Apply DISABLED_INTERVENTIONS / ENABLE_EXPERIMENTAL once, lazily.
+
+        The env vars are read on the first for_hook()/list() call — by then
+        all plug-in modules (banking, verify_before_mutate, ...) have had a
+        chance to register. Calling this from __init__ would happen before
+        registrations and be a no-op.
+        """
+        if self._env_applied:
+            return
+        self._env_applied = True
+        # Apply enables first so an explicit disable still wins.
+        self._env_enabled_experimental_ids = _apply_env_enables(self)
+        self._env_disabled_ids = _apply_env_disables(self)
+        if self._env_disabled_ids or self._env_enabled_experimental_ids:
+            print(
+                f"[interventions] env overrides: "
+                f"disabled={self._env_disabled_ids} "
+                f"enabled_experimental={self._env_enabled_experimental_ids}",
+                file=sys.stderr,
+            )
+
+
+def _apply_env_disables(registry: InterventionRegistry) -> list[str]:
+    """Read DISABLED_INTERVENTIONS env var and flip matching IDs to 'disabled'.
+
+    Returns the list of IDs that were successfully disabled (skips unknown IDs
+    with a stderr warning).
+    """
+    raw = os.environ.get("DISABLED_INTERVENTIONS", "")
+    if not raw.strip():
+        return []
+    ids = [x.strip().upper() for x in raw.split(",") if x.strip()]
+    disabled: list[str] = []
+    for intervention_id in ids:
+        if registry.get(intervention_id) is None:
+            print(
+                f"[interventions] warning: DISABLED_INTERVENTIONS={intervention_id} — unknown id, skipping",
+                file=sys.stderr,
+            )
+            continue
+        registry.set_status(intervention_id, "disabled")
+        disabled.append(intervention_id)
+    return disabled
+
+
+def _apply_env_enables(registry: InterventionRegistry) -> list[str]:
+    """If ENABLE_EXPERIMENTAL is truthy, flip all experimental interventions to active."""
+    if os.environ.get("ENABLE_EXPERIMENTAL", "0") not in ("1", "true", "yes"):
+        return []
+    flipped: list[str] = []
+    # Iterate registry internals directly — going through .list() would trip
+    # the lazy _ensure_env_overrides_applied() guard and re-enter this helper.
+    for iid in registry._order:
+        intv = registry._by_id[iid]
+        if intv.status == "experimental":
+            registry.set_status(iid, "active")
+            flipped.append(iid)
+    return flipped
 
 
 # Module-level singleton. Import and call ``REGISTRY.register(...)`` from
