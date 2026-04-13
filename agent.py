@@ -140,9 +140,16 @@ sed -n '1,200p' <matched_file>
 Use `sed -n 'START,ENDp'` for partial reads — most docs are 50-300 lines and
 you only need the relevant section. Use `cat` only for short docs (<100 lines).
 
-### Step 4 — Act on what you found
-Unlock/call the discoverable tools mentioned in the doc, following all BASE
-INSTRUCTIONS rules (verification, enum constraints, unlock-vs-give routing).
+### Step 4 — Act IMMEDIATELY when you find a tool name
+CRITICAL: when grep or cat output contains a discoverable tool name (anything
+matching `<word>_<4+ digits>`, e.g. `order_replacement_credit_card_7291`),
+STOP searching and ACT:
+1. `unlock_discoverable_agent_tool(agent_tool_name="<exact_name>")`
+2. Then `call_discoverable_agent_tool(agent_tool_name="<exact_name>", arguments=...)`
+Do NOT continue grepping after finding the tool — the biggest failure mode
+in terminal_use is finding the tool name but then searching more instead of
+unlocking+calling it. Search → find tool → unlock → call → THEN search more
+if the task needs additional steps.
 
 ### Step 5 — Repeat if needed
 If you need more info, go back to Step 2 with different keywords. Budget
