@@ -109,52 +109,57 @@ TERMINAL_PROMPT_SECTION = """
 ## Terminal-mode retrieval (RETRIEVAL_VARIANT=terminal_use)
 
 You have a `shell` tool instead of `KB_search`. The banking KB is mounted as
-JSON/Markdown files on disk. Follow this exact workflow:
+Markdown/JSON files on disk. Prefix all shell commands with `LC_ALL=C` to
+avoid encoding errors (e.g., `LC_ALL=C grep -Rin ...`).
 
-### Step 1 — Orient (ALWAYS do this first)
+### Step 1 — Orient
 ```
 ls -la
 ```
-Discover the KB mount path (typically `./documents/` or `./`). Note the doc
-filename pattern: `doc_<category>_<slug>_NNN.md` (or `.json`).
+Discover the KB mount path and doc filename pattern: `doc_<category>_<slug>_NNN.md`.
 
-### Step 2 — Search with content (NEVER use grep -l)
+### Step 2 — Search by DOMAIN CONCEPT (not tool name)
 ```
-grep -Rin "<keyword>" doc_<category>_* | head -n 50
+LC_ALL=C grep -Rin "<domain keyword>" doc_<category>_* | head -n 50
 ```
-CRITICAL rules:
-- Use `-Rin` (recursive, case-insensitive, line-numbers) so you see matching
-  CONTENT, not just filenames. **NEVER use `-l`** — you need the excerpts to
-  spot discoverable tool names like `submit_cash_back_dispute_0589`.
-- **ALWAYS pipe to `| head -n 50`** to prevent output explosion.
-- Target a doc category prefix when possible: `doc_bank_accounts_*`,
-  `doc_credit_cards_*`, `doc_checking_accounts_*`, `doc_savings_accounts_*`,
-  `doc_debit_cards_*`. This is MUCH faster than searching all docs.
-- If the first search returns nothing, broaden with alternation:
-  `grep -Rin "term1\\|term2\\|term3" doc_<category>_* | head -n 50`
+Search for the PROBLEM or PROCEDURE name, not the tool name:
+- "replacement card" not "order_replacement_credit_card_7291"
+- "cash back dispute" not "submit_cash_back_dispute_0589"
+- "account ownership" not "transfer_to_human_agents"
 
-### Step 3 — Read the best hit (partial, not full)
+Rules:
+- Use `-Rin` (recursive, case-insensitive, line-numbers). **NEVER `-l`**.
+- **ALWAYS pipe `| head -n 50`**.
+- Target a doc category prefix: `doc_credit_cards_*`, `doc_checking_accounts_*`,
+  `doc_savings_accounts_*`, `doc_debit_cards_*`, `doc_bank_accounts_*`.
+- Broaden with alternation: `grep -Rin "term1\\|term2" doc_<cat>_* | head -n 50`
+
+### Step 3 — Read the FULL doc (tool names + args are inside)
 ```
-sed -n '1,200p' <matched_file>
+cat <matched_file>
 ```
-Use `sed -n 'START,ENDp'` for partial reads — most docs are 50-300 lines and
-you only need the relevant section. Use `cat` only for short docs (<100 lines).
+ALWAYS cat the full doc once grep points you to it. The doc contains:
+- The exact discoverable tool name with its numeric suffix
+- The required arguments and their valid values
+- The step-by-step procedure to follow
+
+Do NOT skip this step or only read partial content — you will miss tool names
+and argument requirements that are critical for the task.
 
 ### Step 4 — Act IMMEDIATELY when you find a tool name
-CRITICAL: when grep or cat output contains a discoverable tool name (anything
-matching `<word>_<4+ digits>`, e.g. `order_replacement_credit_card_7291`),
-STOP searching and ACT:
-1. `unlock_discoverable_agent_tool(agent_tool_name="<exact_name>")`
-2. Then `call_discoverable_agent_tool(agent_tool_name="<exact_name>", arguments=...)`
-Do NOT continue grepping after finding the tool — the biggest failure mode
-in terminal_use is finding the tool name but then searching more instead of
-unlocking+calling it. Search → find tool → unlock → call → THEN search more
-if the task needs additional steps.
+When a doc names a discoverable tool (anything with `_<4+ digits>` suffix):
+1. STOP searching
+2. `unlock_discoverable_agent_tool(agent_tool_name="<exact_name_from_doc>")`
+3. `call_discoverable_agent_tool(agent_tool_name="<exact_name>", arguments=...)`
 
-### Step 5 — Repeat if needed
-If you need more info, go back to Step 2 with different keywords. Budget
-~30-50 shell commands per task. Systematic broadening is fine; aimless
-repetition is not.
+NEVER guess tool names — read them from docs. The unlock and call must happen
+back-to-back. Do NOT do more searching between finding the name and calling.
+After the call completes, THEN search more if the task needs additional steps.
+
+### Step 5 — Interleave search and action
+Top-performing agents interleave: search → find tool → unlock+call → search
+for next tool → unlock+call. Do NOT batch all searching first — act as soon
+as you find each tool, then continue searching for the next one.
 
 ### KB_search replacement
 Wherever BASE INSTRUCTIONS say "KB_search", use shell grep/cat instead.
