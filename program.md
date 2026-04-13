@@ -1,6 +1,6 @@
 # τ³-bench Banking Knowledge Agent
 
-Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning). The realistic ceiling for `gpt-4.1-mini` (the swarm's standard agent model) is roughly **15–25%** per two independent research analyses — beyond that you'd need a stronger model, which the swarm protocol forbids.
+Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning). The swarm's standard agent model is now **gpt-5.4-mini** (`SOLVER_MODEL=gpt-5.4-mini`). Previous work with gpt-4.1-mini reached a ceiling of 11/97 (11.3%) on BM25 retrieval.
 
 This is the single hardest τ³ domain and has the most room for improvement.
 
@@ -54,7 +54,12 @@ docs/experiment_playbook.md — recipes for common experiments
 The agent has access to:
 - **Base tools**: `get_user_information_*`, `log_verification`, `transfer_to_human_agents`, `get_current_time`, and transactional queries (`get_credit_card_*`, etc.)
 - **Discovery meta-tools**: `list_discoverable_agent_tools`, `unlock_discoverable_agent_tool`, `give_discoverable_user_tool`, `call_discoverable_agent_tool`
-- **Knowledge retrieval**: `KB_search` (BM25 lexical) — to find procedures in 698 docs
+- **Knowledge retrieval**: configurable via `RETRIEVAL_VARIANT` env var:
+  - `bm25` (default) — `KB_search` tool, BM25 lexical retrieval over 698 docs
+  - `terminal_use` — `shell` tool (grep/cat/sed over KB docs mounted on disk). Requires `sandbox-runtime`. Previous swarm findings: terminal_use roughly doubles scores on stronger models but was worse than BM25 on gpt-4.1-mini. With gpt-5.4-mini, terminal_use lite results range 6-8/20 vs BM25 lite 4-8/20.
+  - `openai_embeddings` — semantic search via OpenAI embeddings
+  - `golden_retrieval` — perfect retrieval (ceiling test only, ~40% pass^1)
+  - Agents are FREE to try any retrieval config. Set via: `RETRIEVAL_VARIANT=terminal_use bash eval/eval.sh`
 - **Domain policy**: dynamically assembled from retrieved documents
 
 ## The core challenge: discoverable tools
@@ -119,7 +124,27 @@ When the lite eval finishes, it prints a per-cluster breakdown to stderr:
 
 This is the signal you ACT on. If `dispute_calculator` improved and `canary` is intact, ship it. If `canary` regressed, revert and diagnose.
 
-### Mode 2: Full eval (97 tasks, ~16 min, ~$1-2)
+### MANDATORY: Trace analysis after EVERY eval
+
+After every eval run (lite or full), `eval/eval.sh` extracts failure traces to `traces/latest.json`. You MUST analyze them before your next code change:
+
+```python
+python3 -c "
+import json
+with open('traces/latest.json') as f:
+    tr = json.load(f)
+for t in tr['failure_traces']:
+    ad = t.get('action_details', [])
+    matched = sum(1 for a in ad if a.get('matched'))
+    gap = len(ad) - matched
+    if gap <= 3:
+        print(f'{t[\"task_id\"]}: gap={gap} db={t.get(\"db_match\")} term={t.get(\"termination_reason\")}')
+"
+```
+
+Focus on gap=0 (all actions right but DB wrong) and gap=1 (one fix away from passing) tasks. These are your highest-leverage optimization targets. Do NOT just look at the score — the traces tell you WHERE to optimize.
+
+### Mode 2: Full eval (97 tasks, ~25 min, ~$5-8 with gpt-5.4-mini)
 
 ```bash
 bash eval/eval.sh > run.log 2>&1                     # full 97 (default)
@@ -176,13 +201,13 @@ Run via `bash eval/rerun_harness.sh 4` (Stage A) or `bash eval/rerun_harness.sh 
 - `tau2-bench/` — frozen upstream benchmark.
 - `prepare.sh` or `requirements.txt` — environment setup is fixed.
 - The user simulator model (`USER_MODEL=gpt-4.1-2025-04-14`).
-- The agent model for leaderboard runs (`SOLVER_MODEL=gpt-4.1-mini` is the swarm convention — using a stronger model breaks comparability with other agents' runs).
+- The agent model for leaderboard runs is `SOLVER_MODEL=gpt-5.4-mini`. Set via env var.
 
 ## Goal: maximize pass^1 accuracy
 
 A task "passes" when the agent achieves reward ~ 1.0 (correct actions + correct communication + correct DB state). Accuracy = fraction of 97 tasks that pass.
 
-**Cost** is a soft constraint. Default `SOLVER_MODEL=gpt-4.1-mini`. Some cost increase is acceptable for meaningful gains, but prefer single-pass solutions.
+**Cost** is a soft constraint. Default `SOLVER_MODEL=gpt-5.4-mini`. Some cost increase is acceptable for meaningful gains, but prefer single-pass solutions.
 
 **Simplicity criterion**: All else being equal, simpler is better.
 
