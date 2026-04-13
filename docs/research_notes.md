@@ -83,6 +83,65 @@ The framework rejects duplicate IDs, validates hook/status at registration,
 and the CLI `scripts/list_interventions.py` auto-imports all
 `interventions_*.py` files for standalone discoverability.
 
+## Retrieval swap — empirically closed (2026-04-12)
+
+Six retrieval variants tested on our stack (gpt-4.1-mini + 8 interventions):
+
+| Variant | Lite score | vs BM25 |
+|---|---|---|
+| BM25 (baseline) | 6-9/20 (noise band) | — |
+| `golden_retrieval` (oracle perfect docs) | 9/20 | ±0 — **ceiling** |
+| `openai_embeddings` | 8/20 | −1 (lexical loss on canary tokens) |
+| `bm25_reranker` (+LLM reranker on BM25) | 6/20 | ±0 (noise) |
+| `terminal_use` | 2/20 | −7 (annotator incompatible) |
+
+**Retrieval is not the bottleneck for our model tier.** `golden_retrieval` —
+eliminating retrieval error entirely — produced no improvement. Not tested:
+`qwen_embeddings` (needs OPENROUTER_API_KEY we don't have), `full_kb` (would
+blow context window), `bm25_grep` (additive, can't exceed golden ceiling).
+
+## Failure bottleneck classification (2026-04-12)
+
+13 failures from a lite run, manually re-classified per brian2's corrected
+rubric (the stock P1 classifier is unreliable — 0 true P1s in the sample):
+
+| Root cause | Count | % | Fix layer |
+|---|---|---|---|
+| Retrieval-bound | 0 | 0% | — |
+| Execution discipline (stopped early, wrong order) | 4 | 31% | gate / annotator prompt |
+| Argument fidelity (nested JSON, enum mismatch) | 3 | 23% | enum gate / canonicalization |
+| Verification / two-sided unlock lifecycle | 3 | 23% | interventions |
+| Model ceiling (task_024 wrong card, task_091 25 steps) | 2 | 15% | stronger model |
+| Oracle-divergent (task_005 fake bypass code) | 1 | 8% | unfixable |
+
+**77% agent-bound, 15% model-bound, 0% retrieval-bound.** Matches the
+`golden_retrieval = BM25` finding.
+
+## Model upgrade paths (2026-04-12)
+
+Plumbing already exists: `SOLVER_MODEL` env var flows into
+`litellm.completion(model=...)`. Only needs a new API key in `.env`.
+Verified via `litellm.get_model_info` that all candidate models resolve.
+
+| Model | litellm ID | Env var | Lite cost | Paper BM25 | Paper + Gold |
+|---|---|---|---|---|---|
+| Claude Sonnet 4.5 | `claude-sonnet-4-5` | ANTHROPIC_API_KEY | ~$3 | 14-17% | 32-35% |
+| Claude Opus 4.5 | `claude-opus-4-5` | ANTHROPIC_API_KEY | ~$5.5 | 17-18% | 38-40% |
+| Claude Haiku 4.5 | `claude-haiku-4-5` | ANTHROPIC_API_KEY | ~$1 | not in paper | — |
+| GPT-5.2 | `gpt-5.2` | OPENAI_API_KEY (have) | ~$2.7 | 9.5% | 32.7% |
+| Gemini 3 Pro | `gemini/gemini-3-pro-preview` | GEMINI_API_KEY | ~$2.5 | 13.7% | 33.3% |
+| Gemini 3 Flash | `gemini/gemini-3-flash-preview` | GEMINI_API_KEY | ~$0.6 | 18.6% | 36.3% |
+
+OpenRouter (`openrouter/anthropic/claude-sonnet-4-5` etc.) works with a
+single `OPENROUTER_API_KEY` — one key, all 6 providers, ~5% credit markup.
+
+Reasoning mode not currently wired — `llm_args_agent={"temperature": 0.0}`
+only. Paper scores likely used extended thinking; replicating requires
+adding `{"thinking": {"type": "enabled", "budget_tokens": 8000}}` or
+similar to `run_eval.py`. Without it, expect 50-70% of headline scores.
+
+See `docs/action_plan.md` for the current-recommended experiment sequence.
+
 ## Historical artifacts (discarded)
 
 The following docs were consolidated and deleted: `program_md_review.md` (6
