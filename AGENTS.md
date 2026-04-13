@@ -624,7 +624,62 @@ Facts in this file should be verifiable. If you discover one is wrong:
 
 ---
 
-## 15. Where other information lives
+## 15. Cross-model task difficulty tiers
+
+Derived from trajectory analysis of 8 frontier models (GPT-5.2, Claude Opus/Sonnet 4.5, Gemini 3 Flash/Pro, GLM-5, Qwen 3.5-397B) on the banking_knowledge domain, 4 trials each (97 tasks × 8 models × 4 trials = 3,104 simulations).
+
+### Tier 1 — Easy (>50% cross-model average pass rate, ~11 tasks)
+
+Simple single-action tasks, mostly credit card applications. These are your canary tasks — if they regress, you broke something fundamental.
+
+Tasks: task_001, task_002, task_006, task_025, task_033, task_035 (and ~5 others depending on model)
+
+**Category insight**: Simple `credit_card` applications have 50-82% pass rate across models. These are low-hanging fruit.
+
+### Tier 2 — Moderate (10-50%, ~25 tasks)
+
+Multi-step tasks with 2-3 expected actions. Transfer decisions, account lookups with verification.
+
+**Category insight**: `transfer` decisions have 30-85% pass rate with high model-dependent variance.
+
+### Tier 3 — Hard (1-10%, ~25 tasks)
+
+Complex multi-step procedures requiring 4+ actions in sequence.
+
+**Category insight**: Discoverable tool chains (4+ actions) hit 0-20% even for the best models. User-side tool handoff (`give_discoverable_user_tool` + wait for customer) is 0-41%.
+
+### Tier 4 — Universally unsolvable (0% across all 8 models, 36 tasks)
+
+These tasks failed for EVERY model across all 4 trials. They likely require capabilities beyond current LLMs or represent extremely complex multi-step procedures (10+ expected actions).
+
+Tasks: task_015, task_020, task_026, task_027, task_029, task_038, task_039, task_046, task_049, task_053, task_054, task_060, task_061, task_062, task_063, task_065, task_066, task_067, task_068, task_069, task_070, task_071, task_072, task_073, task_074, task_077, task_078, task_079, task_080, task_081, task_082, task_083, task_084, task_085, task_090, task_091
+
+**Important**: These results are from models using both `terminal_use` and embedding-based retrieval. Some Tier 4 tasks may become solvable with terminal_use + better agent logic — don't ignore them entirely.
+
+### Most discriminating tasks (highest cross-model variance)
+
+These tasks separate good agents from great ones. If your change moves these, it's real signal:
+
+| Task | Variance | Best Model | Worst Model |
+|---|---|---|---|
+| task_012 | 0.228 | Opus/Sonnet/GLM/Qwen (100%) | Gemini Flash/Pro (0%) |
+| task_089 | 0.204 | Opus/GPT-5.2 (100%) | GLM/Qwen/GPT-none (0%) |
+| task_017 | 0.192 | Opus/Sonnet (100%) | GLM/Qwen/GPT-none (0%) |
+| task_032 | 0.179 | Opus/Flash/GPT-high/GPT-none (100%) | GLM (0%) |
+| task_001 | 0.177 | Opus/Sonnet/GPT-high (100%) | GLM/Qwen (0%) |
+
+### Retrieval config impact (the single strongest lever)
+
+| Retrieval | Models | Pass^1 Range | Avg |
+|---|---|---|---|
+| terminal_use | GPT-5.2[h], Opus, Sonnet, Flash, Pro | 15.7-25.5% | ~21.8% |
+| embeddings/bm25 | GPT-5.2[n], GLM-5, Qwen 3.5 | 9.8-12.4% | ~10.7% |
+
+Full per-model analyses: https://github.com/BrianChen26/tau3_research
+
+---
+
+## 16. Where other information lives
 
 | Question | File |
 |---|---|

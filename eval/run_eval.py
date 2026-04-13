@@ -178,12 +178,18 @@ NUM_TRIALS = 1
 SAMPLE_FRAC = float(os.environ.get("SAMPLE_FRAC", "1.0"))  # e.g. 0.1 for 10%
 MODEL = os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
 USER_MODEL = os.environ.get("USER_MODEL", "gpt-4.1-2025-04-14")
-# Retrieval variant — tau2-bench has 19 options. Default bm25 matches the
-# official benchmark. Override to test retrieval ceiling / alternatives:
+# Retrieval variant — tau2-bench has 19 options.
+# Default is terminal_use (shell-based search) which gives the agent direct
+# filesystem access to grep/cat the 698-doc knowledge base. Cross-model
+# trajectory analysis on 8 frontier models shows terminal_use retrieval
+# correlates with 2x+ higher pass^1 vs embedding-based methods:
+#   terminal_use models:      20-25% pass^1
+#   embedding-based models:   10-12% pass^1
+# Override to compare alternatives:
+#   RETRIEVAL_VARIANT=bm25              — BM25 lexical search (previous default)
 #   RETRIEVAL_VARIANT=golden_retrieval  — perfect retrieval (ceiling test)
 #   RETRIEVAL_VARIANT=openai_embeddings — semantic search
-#   RETRIEVAL_VARIANT=terminal_use      — shell-based search
-RETRIEVAL_VARIANT = os.environ.get("RETRIEVAL_VARIANT", "bm25")
+RETRIEVAL_VARIANT = os.environ.get("RETRIEVAL_VARIANT", "terminal_use")
 # τ²-bench's stock max_concurrency is 3 (set in config.py). The eval is
 # API-bound (not CPU-bound) so we can run many simulations in parallel
 # without contention. Concurrency=8 keeps peak TPM ~1.3M (2/3 of the 2M
@@ -222,8 +228,9 @@ MAX_CONCURRENCY = int(os.environ.get("EVAL_CONCURRENCY", "8"))
 
 LITE_TASK_CLUSTERS: dict[str, list[str]] = {
     # 4 always-pass canaries — regression detector
+    # Cross-model data: these pass for 5-7/8 frontier models (Tier 1 tasks)
     "canary": [
-        "task_001",  # 3/4 historical (escalation, simple)
+        "task_001",  # 100% for Opus/Sonnet/GPT-high; 0% for GLM/Qwen (discriminator)
         "task_004",  # 4/4 historical (account ownership dispute)
         "task_007",  # 4/4 historical (simple lookup)
         "task_076",  # 4/4 historical (simple resolution)
@@ -257,10 +264,11 @@ LITE_TASK_CLUSTERS: dict[str, list[str]] = {
         "task_005",  # 0/4 (placeholder/dispute, customer-derailment)
         "task_091",  # 0/4 (DOB mismatch escalation, 25 expected actions)
     ],
-    # 2 recently-flipped tasks (passed in v5 but not earlier)
-    "recently_flipped": [
-        "task_019",  # 1/4 (passed only in v5)
-        "task_024",  # 1/4 (passed only in v5)
+    # 2 high-discrimination tasks from cross-model trajectory analysis
+    # These have the highest variance across 8 frontier models — moves here are real signal
+    "cross_model_discriminator": [
+        "task_012",  # highest variance (0.228): 100% Opus/Sonnet/GLM/Qwen, 0% Flash/Pro
+        "task_032",  # high variance (0.179): 100% for 4 models, 0% for GLM
     ],
 }
 

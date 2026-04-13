@@ -1,6 +1,10 @@
 # τ³-bench Banking Knowledge Agent
 
-Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning). The realistic ceiling for `gpt-4.1-mini` (the swarm's standard agent model) is roughly **15–25%** per two independent research analyses — beyond that you'd need a stronger model, which the swarm protocol forbids.
+Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning on terminal_use retrieval). The realistic ceiling depends heavily on retrieval config:
+
+- **BM25 ceiling (exhausted)**: ~11/97. The swarm hit this wall after extensive optimization — annotator additions are net-negative at this frontier because they compete for the LLM's attention budget.
+- **terminal_use ceiling (current target)**: ~20-24/97 projected. Cross-model trajectory analysis on 8 frontier models shows terminal_use retrieval correlates with 2x+ higher scores vs embedding-based methods.
+- **Oracle retrieval ceiling**: ~40% (from tau-Knowledge paper findings).
 
 This is the single hardest τ³ domain and has the most room for improvement.
 
@@ -54,7 +58,7 @@ docs/experiment_playbook.md — recipes for common experiments
 The agent has access to:
 - **Base tools**: `get_user_information_*`, `log_verification`, `transfer_to_human_agents`, `get_current_time`, and transactional queries (`get_credit_card_*`, etc.)
 - **Discovery meta-tools**: `list_discoverable_agent_tools`, `unlock_discoverable_agent_tool`, `give_discoverable_user_tool`, `call_discoverable_agent_tool`
-- **Knowledge retrieval**: `KB_search` (BM25 lexical) — to find procedures in 698 docs
+- **Knowledge retrieval**: `shell` (terminal_use) — direct filesystem access to grep/cat the 698 KB docs. This replaced BM25/KB_search as the default based on trajectory data showing 2x+ pass^1 improvement.
 - **Domain policy**: dynamically assembled from retrieved documents
 
 ## The core challenge: discoverable tools
@@ -64,13 +68,28 @@ Unlike airline/retail/telecom where the full policy and all tools are upfront, b
 1. The agent gets a BASE tool list (above)
 2. CRITICAL action tools (e.g. `submit_cash_back_dispute_0589`, `update_transaction_rewards_3847`) are NOT in the initial list — they're mentioned only by name in KB_search document prose
 3. Before calling any discoverable tool, the agent must:
-   - Search KB → find the tool name → call `unlock_discoverable_agent_tool(tool_name=...)` (or `give_discoverable_user_tool` if the customer performs the action) → then call it
+   - Search KB (via `shell` grep/cat) → find the tool name → call `unlock_discoverable_agent_tool(tool_name=...)` (or `give_discoverable_user_tool` if the customer performs the action) → then call it
 
 This is the #1 failure mode. The `extract_traces.py` tool captures a `discoverable_tool_analysis` field per failed task showing exactly which tools were mentioned in KB but never unlocked (the `missing_unlocks` list). Read it every run.
 
+## Retrieval config: why `terminal_use` is the default
+
+Cross-model trajectory analysis on 8 frontier models (GPT-5.2, Claude Opus/Sonnet 4.5, Gemini 3 Flash/Pro, GLM-5, Qwen 3.5) revealed that retrieval config is the single strongest predictor of performance:
+
+| Retrieval Config | Models Using It | Pass^1 Range |
+|---|---|---|
+| `terminal_use` (shell) | Top 5 models | 15.7% – 25.5% |
+| `*_embeddings` / `bm25` | Bottom 3 models | 9.8% – 12.4% |
+
+With `terminal_use`, the agent gets a `shell` tool instead of `KB_search`, allowing it to run `grep`, `cat`, `find`, and other Unix commands against the 698-doc knowledge base. The top models use shell for 66% of all tool calls — enabling agentic exploration that structured search can't match.
+
+The swarm exhausted BM25 at ~11/97 after extensive optimization (JSON spacing fix, interventions, annotators). Annotator additions were net-negative at that frontier. Switching to `terminal_use` is projected to raise the ceiling to ~20-24/97.
+
+To fall back to BM25 for comparison: `RETRIEVAL_VARIANT=bm25 bash eval/eval.sh`
+
 ## The primary optimization lever: `annotate_banking()`
 
-`agent.py:annotate_banking()` is the only code path between τ²-bench's BM25 retriever and the LLM. It receives the raw content of every `KB_search` result and can modify/annotate it before the LLM sees it.
+Under `terminal_use`, `annotate_banking()` still processes tool results — but now it receives shell command output (grep matches, cat output) instead of structured KB_search results. The annotator detects discoverable tool names, verification requirements, and enum constraints in the raw text.
 
 **This is where you spend your experiments.**
 
