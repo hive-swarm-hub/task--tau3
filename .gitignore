@@ -21,3 +21,4 @@ eval_runs/
 
 # tau2-bench embedding cache (semantic retrieval)
 data/.embeddings_cache/
+.hive/
