@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import interventions_verify_before_mutate as modk  # noqa: E402
+from interventions import verify_before_mutate as modk  # noqa: E402
 from interventions import HookContext, REGISTRY  # noqa: E402
 
 

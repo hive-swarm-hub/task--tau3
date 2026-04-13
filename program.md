@@ -155,8 +155,8 @@ Run via `bash eval/rerun_harness.sh 4` (Stage A) or `bash eval/rerun_harness.sh 
 
 - `agent.py` — everything. System prompt, annotator, tool handling, gate, state tracking, factory.
 - `compass.py` — the shared discoverable-tool catalog library. Add new methods, scenario playbooks, dispute-calculator extensions, etc.
-- `interventions.py` — the shared registry + hook-dispatch framework. Don't edit the dataclasses or `InterventionRegistry` surface lightly (other agents import these names); do add new interventions. See "Interventions (how to add a new rule)" below.
-- `interventions_<your-idea>.py` — new pattern files at the repo root that import `REGISTRY` and register their own `Intervention(...)` instances. One file per idea.
+- `interventions/` — the shared registry + hook-dispatch framework (`__init__.py`) plus one Python file per plug-in (`banking.py`, `prefer_discoverable_reads.py`, etc.). Don't edit the dataclasses or `InterventionRegistry` surface lightly (other agents import these names); do add new plug-ins. See "Interventions (how to add a new rule)" below.
+- `interventions/<your-idea>.py` — new plug-in files inside the `interventions/` package that import `REGISTRY` and register their own `Intervention(...)` instances. One file per idea.
 - `eval/run_eval.py` — `LITE_TASK_CLUSTERS`, `MAX_CONCURRENCY`, `MODEL`. Don't change the metric or the orchestration loop.
 - `eval/extract_traces.py` — add new diagnostic analyzers. Don't modify the existing ones unless fixing a bug.
 - `eval/test_*.py` — add tests for new logic.
@@ -396,7 +396,7 @@ I   account-class-map                  annotator    arguments     active   lite 
 
 ### Adding your own intervention
 
-Create a new file `interventions_<your-idea>.py` in the repo root. Import `REGISTRY`, construct your `Intervention(...)`, call `REGISTRY.register(...)` at module level. Then add `import interventions_<your-idea>  # noqa` to `agent.py`'s imports so the file loads at startup. One idea per file — keep the diff scannable.
+Create a new file `interventions/<your-idea>.py` in the package directory. Import `REGISTRY`, construct your `Intervention(...)`, call `REGISTRY.register(...)` at module level. Then add `from interventions import <your_idea> as _  # noqa` to `agent.py`'s imports so the file loads at startup. One idea per file — keep the diff scannable. (`scripts/list_interventions.py` auto-imports every file under `interventions/` so running the CLI standalone always shows the full stack.)
 
 Minimal worked example — rewrite a naked base-tool call into its discoverable equivalent when the KB already surfaced the discoverable name (the "base-tool→discoverable" rewriter brian2 flagged on the feed):
 
