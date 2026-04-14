@@ -717,6 +717,7 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
             "unlocked_for_agent": set(),    # names unlocked via unlock_discoverable_agent_tool
             "unlocked_for_user": set(),     # names given via give_discoverable_user_tool
             "kb_search_count": 0,           # how many KB_search (or shell) retrieval calls
+            "kb_queries": [],               # actual query strings (for Intervention K verify gate)
             "gate_interventions": [],       # log of _gate_tool_calls rewrites (for debugging)
             # Retrieval mode — "bm25" (default KB_search) or "terminal_use"
             # (shell tool over KB docs on disk). Interventions may branch on
@@ -798,6 +799,11 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
                     # failure analyzers (extract_traces) keep working under
                     # both retrieval variants. Annotator behavior is unchanged.
                     self._task_state["kb_search_count"] += 1
+                    # Track actual query content for Intervention K verify gate.
+                    # KB_search uses 'query'; shell uses 'command' (full grep cmd).
+                    query = (args.get("query") or args.get("command") or "")
+                    if query:
+                        self._task_state.setdefault("kb_queries", []).append(query.lower())
                 # Domain-specific identity tracking: the extension decides
                 # which tool names reveal a user_id. Banking uses both
                 # get_user_information_by_id and get_credit_card_transactions_by_user;

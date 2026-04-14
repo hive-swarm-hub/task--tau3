@@ -528,6 +528,71 @@ REGISTRY.register(Intervention(
 ))
 
 
+# ── Intervention K (brian, ported by brian2): account_class KB-verify gate ──
+
+def _apply_K_account_class_kb_verify(ctx: HookContext) -> Optional[HookResult]:
+    """K — block open_bank_account_4821 if account_class wasn't searched in KB.
+
+    The agent has the valid account_class set (via Intervention I) but often
+    picks the WRONG class without reading the KB doc for that specific class.
+    This gate forces a 'verify via KB' step: if no prior KB query mentioned
+    the chosen class name, drop the call and ask the agent to search first.
+
+    Originally proposed by @brian (post #42). Ported by brian2 to combine
+    with Intervention I (account_class enum surfacing).
+    """
+    tc = ctx.tool_call
+    if tc.name != "call_discoverable_agent_tool":
+        return None
+    args = tc.arguments if isinstance(tc.arguments, dict) else {}
+    if not isinstance(args, dict):
+        return None
+    if (args.get("agent_tool_name") or "") != "open_bank_account_4821":
+        return None
+    inner_str = args.get("arguments", "")
+    if not isinstance(inner_str, str) or not inner_str:
+        return None
+    try:
+        inner_kwargs = json.loads(inner_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    acct_class = (inner_kwargs.get("account_class") or "").lower()
+    if not acct_class:
+        return None
+    kb_queries = ctx.state.get("kb_queries", []) or []
+    if any(acct_class in q for q in kb_queries):
+        return None
+    return HookResult(
+        drop=True,
+        drop_note=(
+            f"I'm about to open a {inner_kwargs.get('account_class', '')} account "
+            f"but I haven't verified this is the right class for this customer. "
+            f"I should search the KB for '{inner_kwargs.get('account_class', '')}' "
+            f"to confirm eligibility and features before calling."
+        ),
+        log={
+            "turn": ctx.state.get("turn_count", 0),
+            "reason": "blocked_account_class_not_kb_verified",
+            "account_class": acct_class,
+        },
+    )
+
+
+REGISTRY.register(Intervention(
+    id="K",
+    name="account-class-kb-verify",
+    hook="gate_pre",
+    target_cluster="account_opening",
+    author="brian",
+    description=(
+        "Block open_bank_account_4821 when the chosen account_class wasn't "
+        "mentioned in any prior KB query. Forces verify-via-KB before commit. "
+        "From @brian post #42 (gpt-4.1-mini 11/97 + new task_057 pass)."
+    ),
+    apply=_apply_K_account_class_kb_verify,
+))
+
+
 # NOTE: annotator-level interventions (scenario playbook, tool mentions, enum
 # constraints, etc.) currently live inline in agent.py::annotate_banking —
 # registering metadata-only entries (apply=None) would provide false
