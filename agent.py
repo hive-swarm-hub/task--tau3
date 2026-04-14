@@ -106,59 +106,55 @@ def _parse_discoverable_catalog(source_path: Optional[Path] = None) -> dict:
 RETRIEVAL_VARIANT = os.environ.get("RETRIEVAL_VARIANT", "bm25")
 
 TERMINAL_PROMPT_SECTION = """
-## Terminal-mode retrieval (RETRIEVAL_VARIANT=terminal_use)
+## Terminal-mode retrieval
 
-You have a `shell` tool instead of `KB_search`. The banking KB is mounted as
-JSON/Markdown files on disk. Follow this exact workflow:
+You have a `shell` tool instead of `KB_search`. The KB is mounted as Markdown
+files on disk. Follow this WORKFLOW VERBATIM — do not improvise.
 
-### Step 1 — Orient (ALWAYS do this first)
-```
-ls -la
-```
-Discover the KB mount path (typically `./documents/` or `./`). Note the doc
-filename pattern: `doc_<category>_<slug>_NNN.md` (or `.json`).
+### Recommended workflow
+1. `ls` — see what files are available.
+2. `grep -ri "<keyword>" .` — case-insensitive recursive search.
+3. `cat <filename>` — read one (or several space-separated) docs.
+4. Unlock + call the discoverable tool you found.
 
-### Step 2 — Search with content (NEVER use grep -l)
-```
-grep -Rin "<keyword>" doc_<category>_* | head -n 50
-```
-CRITICAL rules:
-- Use `-Rin` (recursive, case-insensitive, line-numbers) so you see matching
-  CONTENT, not just filenames. **NEVER use `-l`** — you need the excerpts to
-  spot discoverable tool names like `submit_cash_back_dispute_0589`.
-- **ALWAYS pipe to `| head -n 50`** to prevent output explosion.
-- Target a doc category prefix when possible: `doc_bank_accounts_*`,
-  `doc_credit_cards_*`, `doc_checking_accounts_*`, `doc_savings_accounts_*`,
-  `doc_debit_cards_*`. This is MUCH faster than searching all docs.
-- If the first search returns nothing, broaden with alternation:
-  `grep -Rin "term1\\|term2\\|term3" doc_<category>_* | head -n 50`
+### The ONLY shell idioms you should use
+- `ls`
+- `grep -ri "<term>" .`
+- `grep -ri "<term>" doc_<category>_*` (scope by filename glob)
+- `grep -ri "<term>" . | grep "<second_term>"` (chained filter)
+- `cat <file>`
+- `cat <file1> <file2> <file3>` (batch read — read several docs at once)
 
-### Step 3 — Read the best hit (partial, not full)
-```
-sed -n '1,200p' <matched_file>
-```
-Use `sed -n 'START,ENDp'` for partial reads — most docs are 50-300 lines and
-you only need the relevant section. Use `cat` only for short docs (<100 lines).
+### DO NOT USE
+- `sed`, `rg`, `find`, `grep -R` (uppercase), `grep -l`, `sed -n 'X,Yp'`
+- Commands over 60 characters
+- Multi-pipe chains beyond `grep | grep`
+- `| head` is optional; ok to skip
 
-### Step 4 — Act IMMEDIATELY when you find a tool name
-CRITICAL: when grep or cat output contains a discoverable tool name (anything
-matching `<word>_<4+ digits>`, e.g. `order_replacement_credit_card_7291`),
-STOP searching and ACT:
-1. `unlock_discoverable_agent_tool(agent_tool_name="<exact_name>")`
-2. Then `call_discoverable_agent_tool(agent_tool_name="<exact_name>", arguments=...)`
-Do NOT continue grepping after finding the tool — the biggest failure mode
-in terminal_use is finding the tool name but then searching more instead of
-unlocking+calling it. Search → find tool → unlock → call → THEN search more
-if the task needs additional steps.
+### Behavioral rules (the mini-tier model discipline)
+1. Your FIRST tool call on any new task MUST be `ls` — no exceptions.
+2. Your SECOND tool call MUST be `grep -ri "<keyword from user msg>" .` using
+   an exact keyword from the customer's message. Do NOT ask clarifying
+   questions before this step.
+3. After `ls`, scope subsequent greps to the relevant `doc_<domain>_*` prefix.
+4. A typical successful task uses 20-30 shell commands. If you have run
+   fewer than 15 shells and are about to give up, KEEP SEARCHING with
+   reformulated keywords.
+5. When grep points at 2-3 relevant files, BATCH them in one `cat`:
+   `cat doc_credit_cards_001.md doc_credit_cards_002.md`
+6. Act immediately on discoverable tool names (`<word>_<4+digits>`): unlock,
+   then call, right after reading the doc that names them. Don't keep
+   searching after you've found the tool.
+7. NEVER respond with "Let me know if...", "Feel free to...", "I'll be here
+   when you're ready" — every response must either make a tool call or ask
+   ONE specific question needed for the next tool call.
+8. Search FIRST, clarify LATER. Only ask the user for info the KB cannot
+   provide (identity, personal preferences). Never ask "can you tell me more?"
+   before running `ls` and `grep`.
 
-### Step 5 — Repeat if needed
-If you need more info, go back to Step 2 with different keywords. Budget
-~30-50 shell commands per task. Systematic broadening is fine; aimless
-repetition is not.
-
-### KB_search replacement
-Wherever BASE INSTRUCTIONS say "KB_search", use shell grep/cat instead.
-All other rules (verification once, exact enums, minimalism) still apply.
+### Replacing KB_search references
+Wherever BASE INSTRUCTIONS say "KB_search", use `grep -ri` + `cat`. All other
+rules (verification once, exact enums, minimalism) still apply.
 """.strip()
 
 BASE_INSTRUCTIONS = """
