@@ -54,12 +54,41 @@ docs/experiment_playbook.md — recipes for common experiments
 The agent has access to:
 - **Base tools**: `get_user_information_*`, `log_verification`, `transfer_to_human_agents`, `get_current_time`, and transactional queries (`get_credit_card_*`, etc.)
 - **Discovery meta-tools**: `list_discoverable_agent_tools`, `unlock_discoverable_agent_tool`, `give_discoverable_user_tool`, `call_discoverable_agent_tool`
-- **Knowledge retrieval**: configurable via `RETRIEVAL_VARIANT` env var:
-  - `bm25` (default) — `KB_search` tool, BM25 lexical retrieval over 698 docs
-  - `terminal_use` — `shell` tool (grep/cat/sed over KB docs mounted on disk). Requires `sandbox-runtime`. Previous swarm findings: terminal_use roughly doubles scores on stronger models but was worse than BM25 on gpt-4.1-mini. With gpt-5.4-mini, terminal_use lite results range 6-8/20 vs BM25 lite 4-8/20.
-  - `openai_embeddings` — semantic search via OpenAI embeddings
-  - `golden_retrieval` — perfect retrieval (ceiling test only, ~40% pass^1)
-  - Agents are FREE to try any retrieval config. Set via: `RETRIEVAL_VARIANT=terminal_use bash eval/eval.sh`
+- **Knowledge retrieval**: 18 variants registered. Set via `RETRIEVAL_VARIANT` env var. Agents are FREE and ENCOURAGED to try any of them:
+
+  **Offline (no extra API key):**
+  - `bm25` (default) — `KB_search` tool, BM25 lexical retrieval
+  - `full_kb` — entire KB in prompt, no retrieval tool (huge context)
+  - `golden_retrieval` — perfect retrieval (diagnostic ceiling test)
+  - `grep_only` — `grep` tool only
+  - `no_knowledge` — no KB at all (baseline)
+
+  **BM25 + enhancements (needs OPENAI_API_KEY):**
+  - `bm25_grep` — BM25 + grep tool
+  - `bm25_reranker` — BM25 + LLM pointwise reranker (UNTESTED, high confidence candidate)
+  - `bm25_reranker_grep` — BM25 + reranker + grep (UNTESTED)
+
+  **Semantic embeddings (needs OPENAI_API_KEY):**
+  - `openai_embeddings` — semantic search (UNTESTED)
+  - `openai_embeddings_grep` (UNTESTED)
+  - `openai_embeddings_reranker` (UNTESTED, closest to mixedbread approach)
+  - `openai_embeddings_reranker_grep` (UNTESTED)
+
+  **Qwen (needs OPENROUTER_API_KEY):**
+  - `qwen_embeddings`, `qwen_embeddings_grep`, `qwen_embeddings_reranker`, `qwen_embeddings_reranker_grep`
+
+  **Shell-based (needs sandbox-runtime):**
+  - `terminal_use` — `shell` tool (grep/cat/ls)
+  - `terminal_use_write` — shell tool with write access
+
+  **Set via:** `RETRIEVAL_VARIANT=bm25_reranker bash eval/eval.sh`
+
+  **Prior swarm findings:**
+  - bm25 + gpt-4.1-mini + swarm: 11/97 ceiling (3 runs converged)
+  - bm25 + gpt-5.4-mini + swarm: ~9/97 mean (peak 10/97)
+  - terminal_use + gpt-5.4-mini: NOT competitive (6-8/97 full eval; model too cautious for 25+ shell calls needed)
+  - Leaderboard #1 (Distyl ButtonAgent) uses mixedbread vector store — not integrated in tau2-bench. Closest tau2-bench analogs: `bm25_reranker` or `openai_embeddings_reranker`.
+  - `bm25_reranker`, `openai_embeddings*`, `bm25_grep` — UNTESTED, high priority for exploration
 - **Domain policy**: dynamically assembled from retrieved documents
 
 ## The core challenge: discoverable tools
