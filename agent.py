@@ -1074,6 +1074,38 @@ class CustomAgent(HalfDuplexAgent[BankingAgentState]):
         # 6. Gate hook — swarm agents put rewrite rules here. NO-OP by default.
         assistant_msg = self._gate_tool_calls(assistant_msg)
 
+        # 6b. Anti-passive-wait gate: detect when the agent is sending the
+        # same text twice in a row with no tool calls. This catches the
+        # gpt-5.4-mini max_steps loop where it says "Okay" or "I'll be
+        # ready when you are" repeatedly. Inject a directive on the second
+        # repeat to take a tool action. Only applies to text-only messages
+        # (tool calls are fine to repeat).
+        if (assistant_msg.content
+                and not assistant_msg.tool_calls
+                and len(assistant_msg.content.strip()) < 200):
+            prev_text = self._task_state.get("_last_text_response", "")
+            curr_text = assistant_msg.content.strip().lower()
+            if prev_text and curr_text == prev_text:
+                # Force a directive into the message so the LLM sees it
+                # next turn and takes a tool action instead.
+                assistant_msg = AssistantMessage(
+                    role="assistant",
+                    content=(
+                        assistant_msg.content
+                        + " [SYSTEM: I noticed I just repeated this exact response. "
+                        "I should NOT wait passively — I should look up the customer's "
+                        "info myself with the tools available, or end the conversation "
+                        "if the task is complete.]"
+                    ),
+                    tool_calls=None,
+                )
+                self._task_state["_last_text_response"] = ""  # reset
+            else:
+                self._task_state["_last_text_response"] = curr_text
+        elif assistant_msg.tool_calls:
+            # Reset on any tool action
+            self._task_state["_last_text_response"] = ""
+
         # 7. Track consecutive tool calls for the loop breaker
         if assistant_msg.tool_calls:
             self._consecutive_tool_calls += 1
