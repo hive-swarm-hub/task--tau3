@@ -93,9 +93,9 @@ def test_reproduce_reconstructs_env_vars_from_snapshot(tmp_path):
         "git_sha": "7f3a9c1abcdef0123456789abcdef0123456789a",
         "git_branch": "hive/test-branch",
         "env": {
-            "RETRIEVAL_VARIANT": "bm25",            # default → should NOT appear
-            "SOLVER_MODEL": "gpt-4.1-mini",         # default → should NOT appear
-            "USER_MODEL": "gpt-4.1-2025-04-14",     # default → should NOT appear
+            "RETRIEVAL_VARIANT": "terminal_use",            # default → should NOT appear
+            "SOLVER_MODEL": "gpt-5.2",         # default → should NOT appear
+            "USER_MODEL": "gpt-5.2",     # default → should NOT appear
             "EVAL_CONCURRENCY": "8",                # default → should NOT appear
             "EVAL_LITE": "1",                       # NON-default → should appear
             "SAMPLE_FRAC": "1.0",                   # default → should NOT appear
@@ -126,7 +126,7 @@ def test_reproduce_reconstructs_env_vars_from_snapshot(tmp_path):
     assert "EVAL_LITE=1" in out
     assert "DISABLED_INTERVENTIONS=E,F" in out
     # Default-valued env vars MUST NOT appear (keeps the reproduce cmd punchy).
-    assert "RETRIEVAL_VARIANT=bm25" not in out
+    assert "RETRIEVAL_VARIANT=terminal_use" not in out
     assert "SOLVER_MODEL=" not in out
     assert "SAMPLE_FRAC=" not in out
     # SHA prefix shown in the report + full SHA in the checkout line.

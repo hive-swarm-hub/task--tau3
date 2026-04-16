@@ -34,9 +34,9 @@ _DEFAULT_SNAPSHOT = _REPO_ROOT / "eval_runs" / "last_config.json"
 # the defaults), since unnecessary env=VAL noise muddies the reproduction
 # command. Pairs map the snapshot-key to (emit_if_not_equal_to_default).
 _ENV_DEFAULTS = {
-    "RETRIEVAL_VARIANT": "bm25",
-    "SOLVER_MODEL": "gpt-4.1-mini",
-    "USER_MODEL": "gpt-4.1-2025-04-14",
+    "RETRIEVAL_VARIANT": "terminal_use",
+    "SOLVER_MODEL": "gpt-5.2",
+    "USER_MODEL": "gpt-5.2",
     "EVAL_CONCURRENCY": "8",
     "EVAL_LITE": "0",
     "SAMPLE_FRAC": "1.0",

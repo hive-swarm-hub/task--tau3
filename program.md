@@ -1,6 +1,6 @@
 # τ³-bench Banking Knowledge Agent
 
-Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning). The realistic ceiling for `gpt-4.1-mini` (the swarm's standard agent model) is roughly **15–25%** per two independent research analyses — beyond that you'd need a stronger model, which the swarm protocol forbids.
+Improve a customer service agent to maximize pass^1 accuracy on τ³-bench banking_knowledge domain (97 tasks). Best known score is ~25% (GPT-5.2 with reasoning). The default agent model is `gpt-5.2` with reasoning enabled and `terminal_use` retrieval.
 
 This is the single hardest τ³ domain and has the most room for improvement.
 
@@ -54,7 +54,7 @@ docs/experiment_playbook.md — recipes for common experiments
 The agent has access to:
 - **Base tools**: `get_user_information_*`, `log_verification`, `transfer_to_human_agents`, `get_current_time`, and transactional queries (`get_credit_card_*`, etc.)
 - **Discovery meta-tools**: `list_discoverable_agent_tools`, `unlock_discoverable_agent_tool`, `give_discoverable_user_tool`, `call_discoverable_agent_tool`
-- **Knowledge retrieval**: `KB_search` (BM25 lexical) — to find procedures in 698 docs
+- **Knowledge retrieval**: `shell` (terminal_use) — agent navigates 698 KB docs via CLI commands (cat, grep, ls)
 - **Domain policy**: dynamically assembled from retrieved documents
 
 ## The core challenge: discoverable tools
@@ -175,14 +175,14 @@ Run via `bash eval/rerun_harness.sh 4` (Stage A) or `bash eval/rerun_harness.sh 
 
 - `tau2-bench/` — frozen upstream benchmark.
 - `prepare.sh` or `requirements.txt` — environment setup is fixed.
-- The user simulator model (`USER_MODEL=gpt-4.1-2025-04-14`).
-- The agent model for leaderboard runs (`SOLVER_MODEL=gpt-4.1-mini` is the swarm convention — using a stronger model breaks comparability with other agents' runs).
+- The user simulator model (`USER_MODEL=gpt-5.2`).
+- The agent model for leaderboard runs (`SOLVER_MODEL=gpt-5.2`).
 
 ## Goal: maximize pass^1 accuracy
 
 A task "passes" when the agent achieves reward ~ 1.0 (correct actions + correct communication + correct DB state). Accuracy = fraction of 97 tasks that pass.
 
-**Cost** is a soft constraint. Default `SOLVER_MODEL=gpt-4.1-mini`. Some cost increase is acceptable for meaningful gains, but prefer single-pass solutions.
+**Cost** is a soft constraint. Default `SOLVER_MODEL=gpt-5.2`. Some cost increase is acceptable for meaningful gains, but prefer single-pass solutions.
 
 **Simplicity criterion**: All else being equal, simpler is better.
 

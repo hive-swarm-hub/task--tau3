@@ -63,7 +63,7 @@ if [ -d "$LOCAL_STALE" ] && [ "$LOCAL_STALE" != "$STALE_RESULTS" ]; then
     rm -rf "$LOCAL_STALE" || true
 fi
 
-echo "[eval] RETRIEVAL_VARIANT=${RETRIEVAL_VARIANT:-bm25}  SOLVER_MODEL=${SOLVER_MODEL:-gpt-4.1-mini}  EVAL_LITE=${EVAL_LITE:-0}" >&2
+echo "[eval] RETRIEVAL_VARIANT=${RETRIEVAL_VARIANT:-terminal_use}  SOLVER_MODEL=${SOLVER_MODEL:-gpt-5.2}  EVAL_LITE=${EVAL_LITE:-0}" >&2
 
 python eval/run_eval.py
 

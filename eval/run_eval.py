@@ -155,7 +155,7 @@ def _print_snapshot_summary(snapshot: dict) -> None:
         sha_short = sha_raw[:7] + ("-dirty" if sha_raw.endswith("-dirty") else "")
         branch = snapshot.get("git_branch", "unknown")
         env = snapshot.get("env", {}) or {}
-        mode = env.get("RETRIEVAL_VARIANT", "bm25")
+        mode = env.get("RETRIEVAL_VARIANT", "terminal_use")
         lite = env.get("EVAL_LITE", "0") == "1"
         mode_str = f"{mode}{' (lite)' if lite else ''}"
         interventions = snapshot.get("interventions", []) or []
@@ -176,18 +176,18 @@ DOMAIN = "banking_knowledge"
 SPLIT = "test"
 NUM_TRIALS = 1
 SAMPLE_FRAC = float(os.environ.get("SAMPLE_FRAC", "1.0"))  # e.g. 0.1 for 10%
-MODEL = os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
-USER_MODEL = os.environ.get("USER_MODEL", "gpt-4.1-2025-04-14")
+MODEL = os.environ.get("SOLVER_MODEL", "gpt-5.2")
+USER_MODEL = os.environ.get("USER_MODEL", "gpt-5.2")
 # Retrieval variant — tau2-bench has 19 options. Default bm25 matches the
 # official benchmark. Override to test retrieval ceiling / alternatives:
 #   RETRIEVAL_VARIANT=golden_retrieval  — perfect retrieval (ceiling test)
 #   RETRIEVAL_VARIANT=openai_embeddings — semantic search
 #   RETRIEVAL_VARIANT=terminal_use      — shell-based search
-RETRIEVAL_VARIANT = os.environ.get("RETRIEVAL_VARIANT", "bm25")
+RETRIEVAL_VARIANT = os.environ.get("RETRIEVAL_VARIANT", "terminal_use")
 # τ²-bench's stock max_concurrency is 3 (set in config.py). The eval is
 # API-bound (not CPU-bound) so we can run many simulations in parallel
-# without contention. Concurrency=8 keeps peak TPM ~1.3M (2/3 of the 2M
-# gpt-4.1-mini ceiling), so retries absorb spikes and no tasks get
+# without contention. Concurrency=8 keeps peak TPM well within the
+# gpt-5.2 ceiling, so retries absorb spikes and no tasks get
 # excluded as infra errors; full 97-task eval ~24min. Override via the
 # EVAL_CONCURRENCY env var.
 # NOTE: concurrency=12 (the previous value) is ~16min wall time but hits
@@ -296,10 +296,10 @@ def run_all():
         task_ids=task_ids,
         agent="custom",
         llm_agent=MODEL,
-        llm_args_agent={"temperature": 0.0},
+        llm_args_agent={},
         user="user_simulator",
         llm_user=USER_MODEL,
-        llm_args_user={"temperature": 0.0},
+        llm_args_user={},
         num_trials=NUM_TRIALS,
         max_steps=200,
         max_errors=10,
@@ -318,9 +318,9 @@ def run_all():
             "git_sha": _git_sha_or_dirty(),
             "git_branch": _git_current_branch_or_detached(),
             "env": {
-                "RETRIEVAL_VARIANT": os.environ.get("RETRIEVAL_VARIANT", "bm25"),
-                "SOLVER_MODEL": os.environ.get("SOLVER_MODEL", "gpt-4.1-mini"),
-                "USER_MODEL": os.environ.get("USER_MODEL", "gpt-4.1-2025-04-14"),
+                "RETRIEVAL_VARIANT": os.environ.get("RETRIEVAL_VARIANT", "terminal_use"),
+                "SOLVER_MODEL": os.environ.get("SOLVER_MODEL", "gpt-5.2"),
+                "USER_MODEL": os.environ.get("USER_MODEL", "gpt-5.2"),
                 "EVAL_CONCURRENCY": os.environ.get("EVAL_CONCURRENCY", "8"),
                 "EVAL_LITE": os.environ.get("EVAL_LITE", "0"),
                 "SAMPLE_FRAC": os.environ.get("SAMPLE_FRAC", "1.0"),
